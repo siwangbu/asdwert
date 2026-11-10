@@ -12,7 +12,7 @@
             "quickSearch": 0,
             "filterable": 1,
             "indexs": 1,
-            "ext": "douban.json"
+            "ext": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/douban.json"
         },
         {
             "key": "webhome",
@@ -46,7 +46,7 @@
             "filterable": 1,
             "changeable": 1,
             "timeout": 60,
-            "ext": "{\"api_key\":\"btk6LlweKAIc8aEVSzmfujPQoxiCdpFMnv3JUX15\",\"api\":\"https://so.js6sou.top\",\"filters\":\"https://pan.meil.wang/f/Ja1tg/douban.json\"}"
+            "ext": "{\"api_key\":\"btk6LlweKAIc8aEVSzmfujPQoxiCdpFMnv3JUX15\",\"api\":\"https://so.js6sou.top\",\"filters\":\"https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/douban.json\"}"
         },
         {
             "key": "ResMgr",
@@ -72,10 +72,24 @@
             "changeable": 0,
             "indexs": 0,
             "filterable": 0,
-            "ext": "https://pan.meil.wang/f/yyQUM/lab.json",
+            "ext": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/lab.json",
             "style": {
                 "type": "rect",
                 "ratio": 1.0
+            }
+        },
+        {
+            "key": "Local",
+            "name": "📁文件[应用]",
+            "type": 3,
+            "api": "csp_Local",
+            "searchable": 0,
+            "changeable": 0,
+            "indexs": 0,
+            "filterable": 1,
+            "ext": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/share.json",
+            "style": {
+                "type": "list"
             }
         },
         {
@@ -160,7 +174,7 @@
             "name": "跳舞/音乐[💖]",
             "type": 3,
             "api": "csp_FileSpider",
-            "jar": "https://github.com/siwangbu/asdwert/blob/main/jar/%E8%AF%95%E8%AF%95.jar",
+            "jar": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/jar/%E8%AF%95%E8%AF%95.jar",
             "searchable": 0,
             "quickSearch": 0,
             "filterable": 0,
@@ -314,20 +328,6 @@
             "filterable": 1
         },
         {
-            "key": "Local",
-            "name": "📁文件[应用]",
-            "type": 3,
-            "api": "csp_Local",
-            "searchable": 0,
-            "changeable": 0,
-            "indexs": 0,
-            "filterable": 1,
-            "ext": "https://pan.meil.wang/f/akefO/share.json",
-            "style": {
-                "type": "list"
-            }
-        },
-        {
             "key": "玩偶",
             "name": "🧩玩偶[4K]",
             "type": 3,
@@ -344,7 +344,7 @@
                     "http://woggpan.xxooo.cf",
                     "https://www.wogg.one"
                 ],
-                "filter": "https://pan.meil.wang/f/340fy/wogg.json"
+                "filter": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/wogg.json"
             },
             "timeout": 60
         },
@@ -1097,8 +1097,6 @@
             "name": "💖大全[戏曲]",
             "type": 3,
             "api": "csp_AppLY",
-            "jar": "https://pan.meil.wang/f/dM8SD/%E6%88%8F%E6%9B%B2.jar",
-            "searchable": 1,
             "quickSearch": 1,
             "filterable": 0,
             "style": {
@@ -1229,7 +1227,7 @@
             "name": "🌍管管[出国]",
             "type": 3,
             "api": "csp_Youtube",
-            "ext": "{\"hls_proxy\":true,\"json\":\"https://pan.meil.wang/f/Oaeh9/youtube_home.json\"}",
+            "ext": "{\"hls_proxy\":true,\"json\":\"https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/youtube_home.json\"}",
             "searchable": 1,
             "quickSearch": 1,
             "filterable": 1,
@@ -1268,7 +1266,7 @@
                 "ratio": 1.433
             },
             "ext": {
-                "json": "https://pan.meil.wang/f/GamFg/bili_home.json"
+                "json": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/bili_home.json"
             }
         },
         {
@@ -1281,7 +1279,7 @@
             "filterable": 1,
             "changeable": 0,
             "ext": {
-                "json": ".https://pan.meil.wang/f/PaMUM/bili_music.json"
+                "json": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/lab.json/bili_music.json"
             },
             "style": {
                 "type": "rect",
@@ -1298,7 +1296,7 @@
             "filterable": 1,
             "changeable": 0,
             "ext": {
-                "json": "https://pan.meil.wang/f/poOF0/bili_edu_primary.json"
+                "json": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/bili_edu_primary.json"
             },
             "style": {
                 "type": "rect",
@@ -1315,7 +1313,7 @@
             "filterable": 1,
             "changeable": 0,
             "ext": {
-                "json": "https://pan.meil.wang/f/2Zyuj/bili_edu_middle.json"
+                "json": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/bili_edu_middle.json"
             },
             "style": {
                 "type": "rect",
@@ -1332,7 +1330,7 @@
             "filterable": 1,
             "changeable": 0,
             "ext": {
-                "json": "https://pan.meil.wang/f/V25U4/bili_edu_high.json"
+                "json": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/bili_edu_high.json"
             },
             "style": {
                 "type": "rect",
@@ -1407,7 +1405,7 @@
             "searchable": 1,
             "quickSearch": 1,
             "filterable": 0,
-            "ext": "https://pan.meil.wang/f/WzVub/legado_sources.json",
+            "ext": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/legado_sources.json",
             "style": {
                 "type": "rect",
                 "ratio": 1.33
@@ -1507,7 +1505,7 @@
         {
             "name": "电视直播📺",
             "type": 1,
-            "url": "https://pan.meil.wang/f/lXXuM/%E5%AE%B6%E5%BA%AD%E7%89%88.txt",
+            "url": "https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/txt/%E5%AE%B6%E5%BA%AD%E7%89%88.txt",
             "epg": "http://epg.51zmt.top:8000/api/diyp/?ch={name}&date={date}",
             "logo": "https://epg.112114.xyz/logo/{name}.png",
             "ua": "okhttp/3.15,AptvPlayer/1.4.0",
