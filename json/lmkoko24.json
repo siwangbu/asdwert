@@ -37,18 +37,6 @@
             }
         },
         {
-            "key": "DoubanPan",
-            "name": "🏠豆瓣[4K]",
-            "type": 3,
-            "api": "csp_DoubanPan",
-            "searchable": 1,
-            "quickSearch": 1,
-            "filterable": 1,
-            "changeable": 1,
-            "timeout": 60,
-            "ext": "{\"api_key\":\"btk6LlweKAIc8aEVSzmfujPQoxiCdpFMnv3JUX15\",\"api\":\"https://so.js6sou.top\",\"filters\":\"https://gh-proxy.org/https://github.com/siwangbu/asdwert/blob/main/json1/douban.json\"}"
-        },
-        {
             "key": "预告",
             "name": "🔔新片[导航]",
             "type": 3,
