@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 import requests
@@ -225,8 +226,6 @@ EPISODE_PREFIX = "hg-episode-v1:"
 # 每条带 main_url + backup_url 双 CDN 与独立加密材料。这里把清晰度作为
 # TVBox 多线路暴露；内封音/视轨在解密 _rewrite_moov 时天然全部保留。
 _HG_QUALITY_LINES = (
-    ("2160", "原画"),
-    ("1440", "蓝光"),
     ("1080", "超清"),
     ("720",  "高清"),
     ("540",  "标准"),
@@ -234,10 +233,8 @@ _HG_QUALITY_LINES = (
     ("360",  "极速"),
 )
 _QUALITY_LINE_NAME_TO_Q = {
-    "原画": "2160", "蓝光": "1440",
     "超清": "1080", "高清": "720", "标准": "540",
-    "流畅": "480", "极速": "360", "2160": "2160", "1440": "1440",
-    "1080": "1080", "720": "720",
+    "流畅": "480", "极速": "360", "1080": "1080", "720": "720",
     "540": "540", "480": "480", "360": "360",
 }
 
@@ -254,7 +251,9 @@ def _split_episode_token(token: str) -> tuple[str, str]:
     return "1080", body
 
 # 官网搜索 SSR 固定约 10 条且几乎不认 page；用多关键词轮换实现“翻页”
-# 注：AI剧/AI漫剧 这套内容类型已按需求移除（与“漫剧”分类逐字重复），故不留 AI 专用关键词。
+_AI_MANJU_KEYWORDS = [
+    "AI漫剧", "AI动画", "AI短剧", "AI动漫", "漫剧AI", "二次元AI", "AI漫画", "动画短剧",
+]
 
 
 # ---- 本机解密缓存 + 自动清理 ----
@@ -368,18 +367,18 @@ def _hg_cache_cleanup(force: bool = False) -> None:
         pass
 
 
-
-def _hg_cached_ok(body: Any) -> bool:
-    """旧的整集缓存可能是 bvc2（黑屏有声），吐出去之前先验一下视轨编码。"""
+def _hg_cache_clear_all() -> None:
     try:
-        if not body:
-            return False
-        i = bytes(body).find(b"stsd")
-        if i < 0:
-            return True
-        return bytes(body)[i + 16 : i + 20] in _DECODABLE_ENTRIES
+        root = _hg_cache_dir()
+        for name in os.listdir(root):
+            fp = os.path.join(root, name)
+            try:
+                if os.path.isfile(fp):
+                    os.remove(fp)
+            except Exception:
+                pass
     except Exception:
-        return True
+        pass
 
 
 def _hg_cache_get(vid: str, quality: str) -> bytes | None:
@@ -416,6 +415,10 @@ def _hg_cache_put(vid: str, quality: str, data: bytes) -> None:
                 os.remove(path + ".tmp")
         except Exception:
             pass
+
+
+def _aes_is_fast() -> bool:
+    return AES_BACKEND in ("cryptography", "pycryptodome")
 
 
 def _aes_is_fast() -> bool:
@@ -530,11 +533,6 @@ _MANJU_KEYWORDS = [
 
 # ===== 官方内容类型与分类（取自官方 hongguoduanju.com 的分类路由体系，与 App 同源同 ID）=====
 _HG_CONTENT_TYPES = [
-    ("comic-drama", "漫剧", [
-        ("", "全部"), ("creative", "脑洞"), ("fantasy", "玄幻"), ("drama", "剧情"),
-        ("apocalypse", "末世"), ("wealthy-family", "豪门"), ("wonder", "奇幻"),
-        ("sci-fi", "科幻"), ("adventure", "冒险"),
-    ]),
     ("real-drama", "真人剧", [
         ("", "全部"), ("romance", "爱情"), ("period", "年代"), ("comeback", "逆袭"),
         ("legend", "传奇"), ("growth", "成长"), ("family", "家庭"), ("clan", "家族"),
@@ -544,12 +542,22 @@ _HG_CONTENT_TYPES = [
         ("disaster", "灾难"), ("action-adventure", "动作冒险"), ("war", "战争"),
         ("variety", "综艺"), ("drama", "剧情"),
     ]),
-    ("comic", "漫画", [("", "全部")]),
+    ("comic-drama", "漫剧", [
+        ("", "全部"), ("creative", "脑洞"), ("fantasy", "玄幻"), ("drama", "剧情"),
+        ("apocalypse", "末世"), ("wealthy-family", "豪门"), ("wonder", "奇幻"),
+        ("sci-fi", "科幻"), ("adventure", "冒险"),
+    ]),
+    ("ai-drama", "AI剧", [
+        ("", "全部"), ("creative", "脑洞"), ("fantasy", "玄幻"), ("drama", "剧情"),
+        ("apocalypse", "末世"), ("wealthy-family", "豪门"), ("wonder", "奇幻"),
+        ("sci-fi", "科幻"), ("adventure", "冒险"),
+    ]),
 ]
 _HG_ROUTES = {k: v for k, v in ((a, b) for a, b, _ in _HG_CONTENT_TYPES)}
 _HG_ALIAS = {
     "all": "real-drama", "latest": "real-drama", "hot": "real-drama",
     "male": "real-drama", "female": "real-drama", "短剧": "real-drama",
+    "ai_comic": "ai-drama", "ai_manju": "ai-drama", "AI漫剧": "ai-drama",
     "manju": "comic-drama", "漫剧": "comic-drama",
 }
 
@@ -577,13 +585,111 @@ def _hg_category_page(route, cat, page):
     p = ((v.get("loaderData") or {}).get("category_$") or {})
     return p
 
-VIDEO_URL = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/"
-VIDEO_URL_ALT = "https://api5-normal-lf.fqnovel.com/novel/player/multi_video_model/v1/"
-# 2026-11-11 实测情报：multi_video_model/v1/ 已停服（任何请求只回空包），
-# 同主机生效的是 video_model/v1/，请求体改为顶层 video_id。两套端点并存，自动择优。
-VIDEO_URL_SINGLE = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/"
-VIDEO_URL_SINGLE_ALT = "https://api5-normal-lf.fqnovel.com/novel/player/video_model/v1/"
+# 首页“推荐”榜单：banner 横幅 + homeSections 热播榜（all/human/comic/ai）
+_HG_RECOMMEND_TABS = (
+    ("all", "热播短剧"),
+    ("human", "热播真人剧"),
+    ("comic", "热播漫剧"),
+    ("ai", "热播AI剧"),
+)
 
+def _hg_recommend_tab(tab):
+    t = str(tab or "").strip().lower()
+    if t in ("human", "真人", "热播真人剧"):
+        return "human"
+    if t in ("comic", "漫剧", "热播漫剧"):
+        return "comic"
+    if t in ("ai", "ai剧", "热播ai剧"):
+        return "ai"
+    return "all"
+
+def _hg_recommend_rows(tab="all"):
+    """首页推荐：banner 横幅在前，热播榜在后，按 series_id 去重。
+    默认“热播短剧”合并四个榜单（短剧/真人剧/漫剧/AI剧，约 31 条）；
+    选了具体榜单时只取该榜（约 13 条）。"""
+    tab = _hg_recommend_tab(tab)
+    page = ((_data(SITE + "/").get("loaderData") or {}).get("page") or {})
+    rows = []
+    seen = set()
+    for src in (page.get("bannerList") or []):
+        sid = str((src or {}).get("series_id") or "")
+        if sid and sid not in seen:
+            seen.add(sid)
+            rows.append(src)
+    sections = page.get("homeSections") or []
+    wanted = ["all", "human", "comic", "ai"] if tab == "all" else [tab]
+    for want in wanted:
+        for section in sections:
+            if str((section or {}).get("tab_type") or "") != want:
+                continue
+            for src in (section.get("video_list") or []):
+                sid = str((src or {}).get("series_id") or "")
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    rows.append(src)
+    if not rows:
+        raise HongguoPluginError("首页没有推荐数据")
+    return rows
+
+# 排行榜与新剧：官网 /rank/{route}?page=N，数据在 _ROUTER_DATA 的 content.rankList（每页 20 条）
+_HG_RANK_ROUTES = (
+    ("hot-drama", "热播榜"),
+    ("hot-real-drama", "热播真人剧"),
+    ("hot-comic-drama", "热播漫剧"),
+    ("hot-ai-drama", "热播AI剧"),
+)
+_HG_RANK_ROUTE_SET = {r for r, _ in _HG_RANK_ROUTES}
+
+def _hg_rank_page(route, page):
+    route = str(route or "hot-drama").strip()
+    if route not in _HG_RANK_ROUTE_SET and route != "new-drama":
+        route = "hot-drama"
+    sess = requests.Session()
+    sess.trust_env = False
+    sess.headers.update({"User-Agent": UA, "Referer": SITE + "/"})
+    r = sess.get(SITE + "/rank/" + route, params={"page": str(max(1, int(page or 1)))}, timeout=25)
+    html = r.text or ""
+    m = re.search(r"(?:window\.)?_ROUTER_DATA\s*=\s*", html)
+    if not m:
+        raise HongguoPluginError("排行榜页没有路由数据")
+    v, _ = json.JSONDecoder().raw_decode(html[m.end():])
+    ld = v.get("loaderData") or {}
+    d = None
+    for k, val in ld.items():
+        if k.startswith("rank_") and k.endswith("/page") and isinstance(val, dict):
+            d = val
+            break
+    if not isinstance(d, dict):
+        raise HongguoPluginError("排行榜页没有数据")
+    content = d.get("content") or {}
+    return content.get("rankList") or []
+
+def _rank_item(x):
+    x = x or {}
+    sid = str(x.get("seriesId") or x.get("series_id") or "")
+    name = str(x.get("title") or x.get("series_title") or "未命名")
+    pic = str(x.get("cover") or x.get("series_cover") or "")
+    try:
+        rk = int(x.get("rank") or 0)
+    except (TypeError, ValueError):
+        rk = 0
+    heat = str(x.get("primaryMetricText") or x.get("heatText") or "")
+    remarks = ("第%s名" % rk) if rk else ""
+    if heat:
+        remarks = (remarks + " · " + heat) if remarks else heat
+    if not remarks:
+        tags = x.get("statusTags") or []
+        if isinstance(tags, list) and tags:
+            remarks = str(tags[0])
+    return {
+        "vod_id": sid,
+        "vod_name": name,
+        "vod_pic": pic,
+        "vod_remarks": remarks,
+        "vod_content": "",
+    }
+
+VIDEO_URL = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/"
 UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 APP_UA = "com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
 MEDIA_UA = "com.phoenix.read/71332"
@@ -600,503 +706,7 @@ _RANGE_FETCH_ATTEMPTS = 3
 _RANGE_FETCH_BACKOFF_SECONDS = 0.8
 
 class HongguoPluginError(RuntimeError):
-    """带稳定错误码的插件异常：日志、502 响应体、自检都认 code。"""
-
-    def __init__(self, message: str = "", code: str = "", detail: str = ""):
-        self.code = code or ""
-        self.detail = detail or ""
-        self.raw_message = message or ""
-        text = ("%s %s" % (code, message)).strip() if code else str(message or "")
-        super().__init__(text)
-
-
-# ======================================================================
-# 失效定位层（诊断日志 / HG_E_* 错误码 / 自检）
-# ----------------------------------------------------------------------
-# 目标：任何一次「取不到播放地址」，事后只看一个文件就能定位到哪一步
-#       断、错误码是什么、上游回了什么状态和响应头，不用再靠猜。
-# 产物（都在诊断目录里，默认 /sdcard/Download）：
-#   hg_diag.log        逐行诊断，单文件 512KB 自动轮转成 hg_diag.log.1
-#   hg_last_error.txt  最近一次失败的人读摘要 + 下一步该查什么
-#   GET /hg_selfcheck  本机流服务上的自检 JSON（服务起来时可用）
-#   GET /hg_diag       本机流服务上的最近失败摘要（纯文本）
-#   Spider.action("diag")  返回最近一次失败摘要（壳支持 action 时可用）
-# 环境变量：HG_DIAG_DIR / HG_DIAG_PATH 自定义位置；HG_DIAG_QUIET=1 只写文件不打印；
-#           HG_NO_PROBE=1 关闭失败后的对照探测。
-# ======================================================================
-import collections as _hg_collections
-import sys as _hg_sys
-
-HG_DIAG_VERSION = "diag-2026-11-16n"   # n: 缓存落盘 hg_cache.json（HG_CACHE_FILE=0 关闭）
-
-_HG_DIAG_LOCK = threading.RLock()
-_HG_DIAG_RING = _hg_collections.deque(maxlen=400)
-_HG_DIAG_LAST: dict[str, Any] = {}
-_HG_DIAG_COUNT: dict[str, int] = {}
-_HG_DIAG_PATH = ""
-_HG_DIAG_DIR = ""
-_HG_DIAG_BYTES = 0
-_HG_DIAG_MAX_BYTES = 1024 * 1024
-_HG_DIAG_BOOT = time.time()
-_HG_DIAG_QUIET = str(os.environ.get("HG_DIAG_QUIET", "") or "").strip() not in ("", "0", "no", "false")
-_HG_PROBE_LOCK = threading.Lock()
-_HG_PROBE_DONE = False
-
-# 错误码 -> 下一步该查什么。写给人看，直接进 hg_last_error.txt。
-_HG_HINTS = {
-    "HG_E_SIGN_REJECTED": "服务端回了 HTTP 200 但空响应：签名被网关静默拒绝。对照同一次运行里的 PROBE 行——弹幕接口正常而这里空，说明是 video_model 的签名/风控；两边都空则是签名算法整体过期。",
-    "HG_E_HTTP_4XX": "上游直接 4xx：参数/版本号/设备身份不合法，或接口路径已变。看 resp 行的 status 与 head。",
-    "HG_E_HTTP_5XX": "上游 5xx 或 CDN 故障：先重试；连续出现即为站点侧异常。",
-    "HG_E_NON_JSON": "响应不是 JSON：可能被劫持、拿到 HTML 错误页或 WAF 拦截页。看 resp 行的 ctype/head。",
-    "HG_E_MODEL_EMPTY": "有 JSON 但没有 video_model/video_list：端点或请求体版本已变（对照 74332 / 7.4.3.32）。",
-    "HG_E_NO_ADDR": "模型里没有播放地址或密钥材料：该集可能下架/付费/地区限制。",
-    "HG_E_NO_MOOV": "拿到地址但首片没有 moov：地址不是真 MP4（错误页）或上游文件结构变了。",
-    "HG_E_NO_TRACK": "有 moov 但没有视频轨：上游只给了音频或分片结构变了。",
-    "HG_E_CODEC": "只有 bytevc2 等壳解不了的编码：换线路，或等直通/备用接口回退。",
-    "HG_E_RANGE": "媒体分片请求失败：签名 URL 过期或 CDN 拒绝 Range。",
-    "HG_E_TIMEOUT": "网络超时：换网络/DNS；看 ms= 判断是取模型慢还是取分片慢。",
-    "HG_E_NET": "连接失败：断网、DNS 或代理拦截。",
-    "HG_E_DEVICE": "设备身份不可用：device_register 没返回有效 did/iid，当前在用随机号。",
-    "HG_E_BIND": "本机 127.0.0.1 端口全部不可用：壳禁止监听，已回退直链或壳代理。",
-    "HG_E_DECRYPT": "解密失败：spade 密钥或 CENC 结构变化。",
-    "HG_E_TOKEN": "集 token 里解析不出 vid：detailContent 给的 id 被壳改写过，或线路与集数对不上。",
-    "HG_E_NO_ROUTE": "所有播放路由都失败：看前面最近一条 FAIL 行。",
-    "HG_E_UNKNOWN": "未归类错误：按 detail 原文判断。",
-}
-
-_HG_RETRYABLE_CODES = (
-    "HG_E_SIGN_REJECTED", "HG_E_MODEL_EMPTY", "HG_E_TIMEOUT", "HG_E_NET",
-    "HG_E_HTTP_5XX", "HG_E_RANGE",
-)
-
-
-def _hg_now() -> str:
-    moment = time.time()
-    return time.strftime("%m-%d %H:%M:%S", time.localtime(moment)) + ".%03d" % int((moment % 1) * 1000)
-
-
-def _hg_ms(started: float) -> int:
-    try:
-        return int((time.time() - started) * 1000)
-    except Exception:
-        return 0
-
-
-def _hg_clean(value: Any, limit: int = 300) -> str:
-    """日志字段清洗：单行、限长，绝不把换行带进日志。"""
-    try:
-        text = value if isinstance(value, str) else str(value)
-    except Exception:
-        text = "?"
-    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    if len(text) > limit:
-        text = text[:limit] + "…"
-    return text
-
-
-def _hg_tail(value: Any, keep: int = 4) -> str:
-    digits = "".join(ch for ch in str(value or "") if ch.isalnum())
-    if not digits:
-        return "-"
-    return "…" + digits[-keep:]
-
-
-def _hg_body_snippet(body: Any, limit: int = 160) -> str:
-    try:
-        raw = bytes(body or b"")
-    except Exception:
-        return ""
-    try:
-        return _hg_clean(raw[:limit].decode("utf-8", "replace"), limit)
-    except Exception:
-        return ""
-
-
-def _hg_headers_brief(headers: Any) -> str:
-    try:
-        parts = []
-        for key in ("Content-Length", "Content-Type", "Server", "x-tt-logid"):
-            value = headers.get(key, "")
-            if value:
-                parts.append("%s=%s" % (key, _hg_clean(value, 60)))
-        if headers.get("Set-Cookie"):
-            parts.append("Set-Cookie=y")
-        return " ".join(parts)
-    except Exception:
-        return ""
-
-
-def _hg_diag_dir() -> str:
-    global _HG_DIAG_DIR
-    if _HG_DIAG_DIR:
-        return _HG_DIAG_DIR
-    candidates = []
-    env = str(os.environ.get("HG_DIAG_DIR", "") or "").strip()
-    if env:
-        candidates.append(env)
-    candidates.append("/sdcard/Download")
-    try:
-        candidates.append(_hg_cache_dir())
-    except Exception:
-        pass
-    try:
-        candidates.append(tempfile.gettempdir())
-    except Exception:
-        pass
-    try:
-        candidates.append(os.getcwd())
-    except Exception:
-        pass
-    for path in candidates:
-        try:
-            os.makedirs(path, exist_ok=True)
-            probe = os.path.join(path, ".hg_diag_w")
-            with open(probe, "wb") as fh:
-                fh.write(b"1")
-            os.remove(probe)
-            _HG_DIAG_DIR = path
-            return path
-        except Exception:
-            continue
-    _HG_DIAG_DIR = ""
-    return ""
-
-
-def _hg_diag_path() -> str:
-    global _HG_DIAG_PATH, _HG_DIAG_BYTES
-    if _HG_DIAG_PATH:
-        return _HG_DIAG_PATH
-    paths = []
-    env = str(os.environ.get("HG_DIAG_PATH", "") or "").strip()
-    if env:
-        paths.append(env)
-    folder = _hg_diag_dir()
-    if folder:
-        paths.append(os.path.join(folder, "hg_diag.log"))
-    for path in paths:
-        try:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(path, "ab") as fh:
-                fh.write(b"")
-            try:
-                _HG_DIAG_BYTES = os.path.getsize(path)
-            except Exception:
-                _HG_DIAG_BYTES = 0
-            _HG_DIAG_PATH = path
-            break
-        except Exception:
-            continue
-    return _HG_DIAG_PATH
-
-
-def _hg_diag_append(line: str) -> None:
-    global _HG_DIAG_BYTES
-    path = _hg_diag_path()
-    if not path:
-        return
-    data = (line + "\n").encode("utf-8", "replace")
-    if _HG_DIAG_BYTES + len(data) > _HG_DIAG_MAX_BYTES:
-        # 留两份历史：一部多季剧点两下就能写满一份，只留 .1 会把上次的失败记录挤没
-        try:
-            old2 = path + ".2"
-            try:
-                if os.path.exists(old2):
-                    os.remove(old2)
-            except Exception:
-                pass
-            try:
-                if os.path.exists(path + ".1"):
-                    os.replace(path + ".1", old2)
-            except Exception:
-                pass
-            os.replace(path, path + ".1")
-        except Exception:
-            pass
-        _HG_DIAG_BYTES = 0
-    with open(path, "ab") as fh:
-        fh.write(data)
-    _HG_DIAG_BYTES += len(data)
-
-
-def _hc_range(value: Any) -> str:
-    return _hg_clean(value, 40)
-
-
-def _hg_diag(tag: str, msg: str = "", **fields: Any) -> str:
-    """写一行诊断：时间 tag 说明 k=v ...。绝不抛异常、绝不带凭据原文。"""
-    parts = [_hg_now(), str(tag)]
-    if msg:
-        parts.append(_hg_clean(msg))
-    for key in sorted(fields):
-        parts.append("%s=%s" % (key, _hg_clean(fields[key])))
-    line = " ".join(part for part in parts if part)
-    try:
-        with _HG_DIAG_LOCK:
-            _HG_DIAG_RING.append(line)
-            _hg_diag_append(line)
-    except Exception:
-        pass
-    if not _HG_DIAG_QUIET:
-        try:
-            print("[红果] " + line)
-        except Exception:
-            pass
-    return line
-
-
-def _hg_err_code(exc: Any) -> str:
-    """把异常归到稳定错误码：日志/502 响应体/自检都只认这套码。"""
-    code = str(getattr(exc, "code", "") or "") if exc is not None else ""
-    if code:
-        return code
-    if not isinstance(exc, BaseException):
-        return "HG_E_UNKNOWN"
-    text = str(exc)
-    low = text.lower()
-    if isinstance(exc, requests.Timeout) or "timed out" in low or "timeout" in low:
-        return "HG_E_TIMEOUT"
-    if isinstance(exc, requests.ConnectionError):
-        return "HG_E_NET"
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-    if isinstance(status, int) and status >= 400:
-        return "HG_E_HTTP_4XX" if status < 500 else "HG_E_HTTP_5XX"
-    for needle, code_name in (
-        ("空响应", "HG_E_SIGN_REJECTED"),
-        ("不是 JSON", "HG_E_NON_JSON"),
-        ("video_model 为空", "HG_E_MODEL_EMPTY"),
-        ("video_model 数据为空", "HG_E_MODEL_EMPTY"),
-        ("没有清晰度", "HG_E_MODEL_EMPTY"),
-        ("缺少地址或密钥", "HG_E_NO_ADDR"),
-        ("没有视轨", "HG_E_NO_TRACK"),
-        ("moov", "HG_E_NO_MOOV"),
-        ("壳解不了", "HG_E_CODEC"),
-        ("媒体分片", "HG_E_RANGE"),
-        ("直通上游返回", "HG_E_RANGE"),
-        ("CENC", "HG_E_DECRYPT"),
-        ("MP4", "HG_E_NO_MOOV"),
-        ("密钥", "HG_E_DECRYPT"),
-        ("device_id/install_id", "HG_E_DEVICE"),
-        ("解密", "HG_E_DECRYPT"),
-        ("端口", "HG_E_BIND"),
-    ):
-        if needle in text:
-            return code_name
-    return "HG_E_UNKNOWN"
-
-
-def _hg_retryable(exc: Any) -> bool:
-    return _hg_err_code(exc) in _HG_RETRYABLE_CODES
-
-
-def _hg_hint(code: str) -> str:
-    return _HG_HINTS.get(str(code or ""), _HG_HINTS["HG_E_UNKNOWN"])
-
-
-def _hg_fail(stage: str, exc: Any = None, **fields: Any) -> str:
-    """记一次失败：定位行 + 更新最近失败 + 重写 hg_last_error.txt，返回错误码。"""
-    error = exc if isinstance(exc, BaseException) else None
-    code = _hg_err_code(error)
-    detail = _hg_clean(exc if exc is not None else "")
-    # str(exc) 里已经带了错误码前缀时不再重复一遍
-    if code and detail.startswith(code):
-        detail = detail[len(code):].strip()
-    try:
-        with _HG_DIAG_LOCK:
-            _HG_DIAG_LAST.clear()
-            _HG_DIAG_LAST.update({
-                "ts": _hg_now(),
-                "stage": stage,
-                "code": code,
-                "detail": detail,
-                "fields": dict(fields),
-            })
-            _HG_DIAG_COUNT[code] = _HG_DIAG_COUNT.get(code, 0) + 1
-    except Exception:
-        pass
-    _hg_diag("FAIL", "%s %s %s" % (stage, code, detail), **fields)
-    _hg_write_last_error()
-    return code
-
-
-def _hg_last_error_text() -> str:
-    """最近一次失败的人读摘要：给 hg_last_error.txt、/hg_diag、action("diag") 共用。"""
-    with _HG_DIAG_LOCK:
-        last = dict(_HG_DIAG_LAST)
-        recent = list(_HG_DIAG_RING)[-12:]
-        counts = dict(_HG_DIAG_COUNT)
-    lines = [
-        "红果取流诊断  %s" % _hg_now(),
-        "诊断日志: %s" % (_hg_diag_path() or "（没有可写目录）"),
-        "",
-    ]
-    if not last:
-        lines.append("本次进程还没有失败记录。")
-    else:
-        lines.append("最近一次失败: %s" % last.get("ts", "-"))
-        lines.append("阶段: %s" % last.get("stage", "-"))
-        lines.append("错误码: %s" % last.get("code", "-"))
-        lines.append("详情: %s" % last.get("detail", "-"))
-        fields = last.get("fields") or {}
-        if isinstance(fields, Mapping) and fields:
-            lines.append("上下文: " + " ".join(
-                "%s=%s" % (key, _hg_clean(fields[key], 80)) for key in sorted(fields)
-            ))
-        lines.append("下一步: " + _hg_hint(last.get("code", "")))
-    if counts:
-        lines.append("本次进程各错误码次数: " + " ".join(
-            "%s=%d" % (key, counts[key]) for key in sorted(counts)
-        ))
-    lines.append("")
-    lines.append("---- 最近 %d 条诊断 ----" % len(recent))
-    lines.extend(recent)
-    return "\n".join(lines) + "\n"
-
-
-def _hg_write_last_error() -> None:
-    try:
-        path = _hg_diag_path()
-        if not path:
-            return
-        target = os.path.join(os.path.dirname(path) or ".", "hg_last_error.txt")
-        text = _hg_last_error_text()
-        with open(target, "w", encoding="utf-8") as fh:
-            fh.write(text)
-    except Exception:
-        pass
-
-
-def _hg_banner() -> None:
-    """启动横幅：把「跑在什么环境、日志写到哪」先钉进日志，免得事后不知道去哪找。"""
-    _hg_diag(
-        "BOOT", "诊断层 %s 就绪" % HG_DIAG_VERSION,
-        diag=_hg_diag_path() or "unwritable",
-        py=_hg_sys.version.split()[0],
-        aes=AES_BACKEND,
-        req=getattr(requests, "__version__", "?"),
-        pid=os.getpid(),
-    )
-
-
-def _hg_selfcheck() -> dict:
-    """自检快照：环境 + 最近失败 + 计数 + 最近日志，/hg_selfcheck 直接吐这个。"""
-    with _HG_DIAG_LOCK:
-        last = dict(_HG_DIAG_LAST)
-        counts = dict(_HG_DIAG_COUNT)
-        recent = list(_HG_DIAG_RING)[-40:]
-    info: dict[str, Any] = {
-        "diag_version": HG_DIAG_VERSION,
-        "diag_path": _hg_diag_path() or "",
-        "quiet": bool(_HG_DIAG_QUIET),
-        "python": _hg_sys.version.split()[0],
-        "aes_backend": AES_BACKEND,
-        "requests": getattr(requests, "__version__", "?"),
-        "uptime_s": int(time.time() - _HG_DIAG_BOOT),
-        "last_error": last,
-        "error_counts": counts,
-    }
-    try:
-        info["endpoints"] = {
-            "multi": VIDEO_URL,
-            "multi_alt": VIDEO_URL_ALT,
-            "single": VIDEO_URL_SINGLE,
-            "single_alt": VIDEO_URL_SINGLE_ALT,
-        }
-    except Exception:
-        pass
-    try:
-        info["sign_order"] = list(_sign_modes_ordered())
-        info["endpoint_order"] = ["single" if item else "multi" for item in _ep_modes_ordered()]
-    except Exception:
-        pass
-    try:
-        with _STREAM_LOCK:
-            device = dict(_STREAM_STATE.get("device") or {})
-            info["stream"] = {
-                "port": int(_STREAM_STATE.get("port") or 0),
-                "sessions": len(_STREAM_STATE.get("sessions") or {}),
-                "device_registered": bool(device.get("registered")),
-                "did": _hg_tail(device.get("device_id", "")),
-            }
-    except Exception as exc:
-        info["stream"] = {"error": _hg_clean(exc, 80)}
-    try:
-        files = _hg_cache_list()
-        info["cache"] = {
-            "dir": _hg_cache_dir(),
-            "files": len(files),
-            "mb": round(sum(item.get("size") or 0 for item in files) / 1048576.0, 1),
-        }
-    except Exception:
-        pass
-    try:
-        info["danmaku"] = {
-            "enabled": bool(_DM_ENABLED),
-            "host": _DM_HOST,
-            "last_err": _hg_clean(_DM_LAST_ERR, 120),
-        }
-    except Exception:
-        pass
-    info["recent"] = recent
-    return info
-
-
-def _hg_contrast_probe(vid: str, config: Mapping[str, Any]) -> None:
-    """取模型全失败后做一次对照探测，把「谁坏了」直接写进日志。
-
-    2026-11-16 的未定分叉是「签名被静默拒绝」还是「整体缺登录态/断网」。
-    这里用两条独立链路对照，每个进程只做一次、总预算约 10 秒：
-      site    官网首页（无签名、无登录）——网络基线
-      danmaku 弹幕接口（同一套 x-ladon/x-argus 签名，另一条业务线）
-    结论写进 PROBE verdict 行，不用再靠人肉猜。
-    """
-    global _HG_PROBE_DONE
-    if str(os.environ.get("HG_NO_PROBE", "") or "").strip() not in ("", "0", "no", "false"):
-        _hg_diag("PROBE", "skipped", reason="HG_NO_PROBE")
-        return
-    with _HG_PROBE_LOCK:
-        if _HG_PROBE_DONE:
-            return
-        _HG_PROBE_DONE = True
-    site_ok = False
-    dm_ok = False
-    try:
-        started = time.time()
-        try:
-            response = _hg_session().get(SITE + "/", timeout=6)
-            site_ok = response.status_code == 200
-            _hg_diag("PROBE", "site", status=response.status_code,
-                     n=len(response.content or b""), ms=_hg_ms(started))
-        except Exception as exc:
-            _hg_diag("PROBE", "site", status=0, code=_hg_err_code(exc),
-                     detail=exc, ms=_hg_ms(started))
-        started = time.time()
-        try:
-            items, _info, _extra = _dm_page(
-                vid, "", 0,
-                str(config.get("device_id") or "") if isinstance(config, Mapping) else "",
-                str(config.get("install_id") or "") if isinstance(config, Mapping) else "",
-            )
-            dm_ok = True
-            _hg_diag("PROBE", "danmaku", ok=1, n=len(items), ms=_hg_ms(started))
-        except Exception as exc:
-            _hg_diag("PROBE", "danmaku", ok=0, code=_hg_err_code(exc),
-                     detail=exc, ms=_hg_ms(started))
-        if site_ok and dm_ok:
-            verdict = "网络与签名链路都通，只有 video_model 被拒：签名/风控针对该接口"
-            code = "HG_E_SIGN_REJECTED"
-        elif not site_ok:
-            verdict = "官网首页也不通：网络/DNS/代理问题，与签名无关"
-            code = "HG_E_NET"
-        else:
-            verdict = "官网通但弹幕签名接口也失败：签名算法整体过期或设备身份被拒"
-            code = "HG_E_SIGN_REJECTED"
-        _hg_diag("PROBE", "verdict", code=code, note=verdict)
-    except Exception:
-        pass
+    pass
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
@@ -1123,77 +733,33 @@ def _first(*values: Any) -> str:
             return result
     return ""
 
-def _trim_store(store: Any, cap: int = 512, max_age: float = 0.0) -> None:
-    """给常驻进程用的字典裁剪：超量就丢最旧的（必要时先丢过期的）。
-
-    影视仓里的 py 进程可能连跑几周不重启，这类"记一下 vid/剧集"的表
-    如果没人裁剪，键值对会一直涨——属于典型的长稳隐患。
-    dict 保序，所以 next(iter(store)) 拿到的就是最早写入的那个。
-    """
-    try:
-        if not isinstance(store, dict):
-            return
-        if max_age > 0:
-            cutoff = time.time() - max_age
-            for key in [k for k, v in store.items() if isinstance(v, (int, float)) and v < cutoff]:
-                store.pop(key, None)
-        while len(store) > cap:
-            try:
-                store.pop(next(iter(store)))
-            except StopIteration:
-                break
-    except Exception:
-        pass
-
-def _json_response(response: requests.Response, stage: str = "upstream") -> Any:
-    """统一读上游响应：先把这次的硬指标写进诊断日志，再判断成不成功。
-
-    2026-11-16 的教训：video_model 回 HTTP 200 + Content-Length: 0 时，旧代码
-    只有一句「空响应」，看不出服务端到底回了什么（Server / x-tt-logid / 是否带
-    Set-Cookie），排查全靠猜。现在固定一行 resp，并把失败归到 HG_E_* 错误码。
-    """
-    status = int(getattr(response, "status_code", 0) or 0)
-    headers = getattr(response, "headers", None) or {}
-    try:
-        body = response.content
-    except Exception:
-        body = b""
-    # 弹幕一轮要打 20 次，成功时不刷屏；失败或非弹幕一律留痕。
-    if not (stage == "danmaku" and status == 200 and body):
-        try:
-            _hg_diag(
-                "resp", stage,
-                status=status,
-                n=len(body),
-                cl=_hg_clean(headers.get("Content-Length", ""), 20),
-                ctype=_hg_clean(headers.get("Content-Type", ""), 60),
-                srv=_hg_clean(headers.get("Server", ""), 40),
-                logid=_hg_clean(headers.get("x-tt-logid", ""), 40),
-                setck=("y" if headers.get("Set-Cookie") else "n"),
-                head=("" if len(body) > 400 else _hg_body_snippet(body, 120)),
-            )
-        except Exception:
-            pass
-    if status >= 500:
-        raise HongguoPluginError(
-            "上游 HTTP %d" % status, code="HG_E_HTTP_5XX", detail=_hg_body_snippet(body)
-        )
-    if status >= 400:
-        raise HongguoPluginError(
-            "上游 HTTP %d" % status, code="HG_E_HTTP_4XX", detail=_hg_body_snippet(body)
-        )
-    if not body:
-        raise HongguoPluginError(
-            "上游取流接口返回空响应（HTTP %s）" % (status or "?"),
-            code="HG_E_SIGN_REJECTED",
-            detail=_hg_headers_brief(headers),
-        )
+def _json_response(response: requests.Response) -> Any:
+    response.raise_for_status()
     try:
         return response.json()
     except ValueError as exc:
-        raise HongguoPluginError(
-            "上游响应不是 JSON", code="HG_E_NON_JSON", detail=_hg_body_snippet(body)
-        ) from exc
+        raise HongguoPluginError("上游响应不是 JSON") from exc
+
+def _get_html(url: str, *, attempts: int = _HTML_FETCH_ATTEMPTS) -> str:
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": UA,
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            response.encoding = response.encoding or "utf-8"
+            return response.text
+        except Exception as error:  # transient proxy/DNS/read failures
+            last_error = error
+            if attempt + 1 < max(1, attempts):
+                time.sleep(_HTML_FETCH_BACKOFF_SECONDS * (attempt + 1))
+    raise HongguoPluginError(f"fetch failed: {url}") from last_error
 
 def _router_data(html: str) -> dict[str, Any]:
     match = re.search(r"(?:window\.)?_ROUTER_DATA\s*=\s*", html)
@@ -1348,6 +914,15 @@ def _parse_track(
     )
     return sizes, offsets, chunk_samples, aux_sizes, aux_offset, sample_count
 
+def _replace_fourcc(data: bytearray, old: bytes, new: bytes) -> None:
+    position = 0
+    while True:
+        position = data.find(old, position)
+        if position < 0:
+            return
+        data[position : position + len(old)] = new
+        position += len(new)
+
 def _replace_sinf(data: bytearray) -> None:
     # sinf 盒的首个子盒必为 frma（CENC 规范：frma/schm/schi）。
     # 这里校验后再清零，避免把 avcC/hvcC 配置数据里恰好出现的 "sinf" 字节
@@ -1431,17 +1006,11 @@ def decrypt_mp4_cenc(data: bytes, content_key: bytes) -> bytes:
 MEDIA_HEADERS = {"User-Agent": MEDIA_UA, "Referer": "https://novel.snssdk.com/"}
 
 _STREAM_PORT_RANGE = (10010, 10030)
-# 每块越小，播放器拿到首字节越快：CENC 是整块解密完才吐，1MB 一块在纯 Python
-# AES 下要 2~8 秒才出声（真机表现为一直转圈、进度条不动）。128KB 一块首字节不到 1 秒，
-# 总吞吐不变（下游按 64KB 连续写）。
-_STREAM_CHUNK = 1 << 17
+_STREAM_CHUNK = 1 << 20
 _STREAM_HEAD_PROBE = 1 << 16
 _STREAM_TTL_SECONDS = 900
 _STREAM_MAX_SESSIONS = 4
 _STREAM_INFLIGHT_WAIT = 60
-# 建会话（取 video_model + 拉 moov）冷启动约 3~18s；播放器连上来时最多等这么久，
-# 超过就带着已有的会话继续，别把响应头拖过播放器的读超时。
-_STREAM_WARM_WAIT = 15
 _STREAM_STATE: dict[str, Any] = {"port": 0, "server": None, "sessions": {}, "inflight": {}}
 _STREAM_LOCK = threading.RLock()
 
@@ -1463,52 +1032,30 @@ def _toplevel_boxes(buf: bytes) -> list[tuple[int, int, bytes]]:
     return boxes
 
 
-_MEDIA_TLS = threading.local()
-
-
-def _media_session() -> "requests.Session":
-    """拉媒体分片用的线程本地 session（keep-alive），省掉每块重新握手。"""
-    ses = getattr(_MEDIA_TLS, "s", None)
-    if ses is None:
-        ses = requests.Session()
-        ses.trust_env = False
-        ses.headers.update(MEDIA_HEADERS)
-        _MEDIA_TLS.s = ses
-    return ses
-
-
 def _range_get(url: str, start: int, end: int) -> tuple[bytes, int]:
-    headers = {"Range": "bytes=%d-%d" % (start, end)}
+    headers = dict(MEDIA_HEADERS)
+    headers["Range"] = "bytes=%d-%d" % (start, end)
     expected = end - start + 1
     last_error: Exception | None = None
     for attempt in range(_RANGE_FETCH_ATTEMPTS):
         if attempt:
             time.sleep(_RANGE_FETCH_BACKOFF_SECONDS * attempt)
         try:
-            response = _media_session().get(url, headers=headers, timeout=60)
+            response = requests.get(url, headers=headers, timeout=60)
         except requests.RequestException as error:
             last_error = error
             continue
         if response.status_code not in (200, 206):
             last_error = HongguoPluginError(
-                "媒体分片请求失败 %s" % response.status_code,
-                code="HG_E_RANGE",
-                detail="range=bytes=%d-%d %s" % (start, end, _hg_headers_brief(response.headers)),
+                "媒体分片请求失败 %s" % response.status_code
             )
-            _hg_diag("range", "非 206", status=response.status_code,
-                     range="%d-%d" % (start, end), n=_hg_ms(0),
-                     srv=_hg_clean(response.headers.get("Server", ""), 40),
-                     head=_hg_body_snippet(response.content, 100))
             continue
         body = response.content
         # 上游偶发返回短包；短于请求长度时重试，避免播放器收到截断数据。
         if not body or (response.status_code == 206 and len(body) < expected):
             last_error = HongguoPluginError(
-                "媒体分片长度不足 %d/%d" % (len(body), expected),
-                code="HG_E_RANGE",
+                "媒体分片长度不足 %d/%d" % (len(body), expected)
             )
-            _hg_diag("range", "短包", status=response.status_code,
-                     got=len(body), want=expected, range="%d-%d" % (start, end))
             continue
         total = 0
         content_range = response.headers.get("Content-Range") or ""
@@ -1520,17 +1067,13 @@ def _range_get(url: str, start: int, end: int) -> tuple[bytes, int]:
             length = response.headers.get("Content-Length") or ""
             total = int(length) if length.isdigit() else 0
         return body, total
-    if last_error is None:
-        last_error = HongguoPluginError("媒体分片请求失败", code="HG_E_RANGE")
-    raise last_error
+    raise last_error or HongguoPluginError("媒体分片请求失败")
 
 
 def _fetch_moov(url: str) -> tuple[int, int, bytes]:
-    started = time.time()
     probe, total = _range_get(url, 0, _STREAM_HEAD_PROBE - 1)
     if not total:
-        raise HongguoPluginError("媒体总长度未知", code="HG_E_NO_MOOV",
-                                 detail="host=%s" % urlparse(url).netloc)
+        raise HongguoPluginError("媒体总长度未知")
     moov_start = 0
     moov_size = 0
     for offset, size, fourcc in _toplevel_boxes(probe):
@@ -1539,26 +1082,14 @@ def _fetch_moov(url: str) -> tuple[int, int, bytes]:
             moov_size = size
             break
     if not moov_size:
-        raise HongguoPluginError(
-            "未找到 moov 顶层盒", code="HG_E_NO_MOOV",
-            detail="host=%s total=%d boxes=%s" % (
-                urlparse(url).netloc, total,
-                ",".join(item[2].decode("latin-1", "replace") for item in _toplevel_boxes(probe)[:6]),
-            ),
-        )
+        raise HongguoPluginError("未找到 moov 顶层盒")
     if moov_start + moov_size > total:
-        raise HongguoPluginError(
-            "moov 越界", code="HG_E_NO_MOOV",
-            detail="start=%d size=%d total=%d" % (moov_start, moov_size, total),
-        )
+        raise HongguoPluginError("moov 越界")
     if moov_start + moov_size <= len(probe):
         return total, moov_start, bytes(probe[moov_start : moov_start + moov_size])
     moov, _ = _range_get(url, moov_start, moov_start + moov_size - 1)
     if len(moov) != moov_size:
-        raise HongguoPluginError("moov 分片长度不符", code="HG_E_NO_MOOV",
-                                 detail="got=%d want=%d" % (len(moov), moov_size))
-    _hg_diag("moov", "ok", host=urlparse(url).netloc, total=total,
-             start=moov_start, size=moov_size, ms=_hg_ms(started))
+        raise HongguoPluginError("moov 分片长度不符")
     return total, moov_start, moov
 
 
@@ -1700,196 +1231,6 @@ def _sample_table(moov: bytes, moov_start: int) -> list[tuple[int, int, bytes]]:
     return samples
 
 
-
-_HG_Q_TO_QTYPE = {"2160": "0", "1440": "2", "1080": "1", "720": "10", "540": "20", "480": "30", "360": "40"}
-_Q_LABEL = {"2160": "原画", "1440": "蓝光", "1080": "超清", "720": "高清", "540": "标准", "480": "流畅", "360": "极速"}
-_QTYPE_TO_Q = {"0": "2160", "2": "1440", "1": "1080", "10": "720", "20": "540", "30": "480", "40": "360"}
-# 壳里播放器认得的标准视轨四字符码；bvc2（ByteVC2）不在其中，只出声音不出画面
-_DECODABLE_ENTRIES = (b"hvc1", b"hev1", b"avc1", b"avc3")
-
-
-def _hg_entry_is_bytevc2(item: Any) -> bool:
-    """单个清晰度条目是不是 ByteVC2（壳解不了，会黑屏只有声音）。"""
-    return isinstance(item, Mapping) and "bytevc2" in str(item.get("gear_des_key") or "")
-
-
-def _hg_is_bytevc2(rows: Any) -> bool:
-    try:
-        return any(_hg_entry_is_bytevc2(x) for x in (rows or []))
-    except Exception:
-        return False
-
-
-_VIDEO_FOURCCS = (b"hvc1", b"hev1", b"hvc2", b"hev2", b"avc1", b"avc3",
-                  b"bvc2", b"bv2C", b"av01", b"vp09", b"encv")
-
-
-def _hg_moov_fourcc(moov: bytes) -> bytes:
-    """从 moov 的 stsd 里取视轨 sample entry 四字符码。
-
-    注意 moov 里音轨、视轨各有一个 stsd，谁在前不固定（实测《反向拿捏2》第 8 集
-    兜底直链的 moov 是音轨 mp4a 在前）。只认第一个 stsd 会把 hvc1 误判成 mp4a，
-    于是明明能播的 hvc1 直链被验成不可播。这里按顺序找第一个「视频类」四字符码。
-    """
-    first = b""
-    i = moov.find(b"stsd")
-    pos = 0
-    while i >= 0:
-        j = i + 4 + 8
-        cc = bytes(moov[j + 4 : j + 8])
-        if not first:
-            first = cc
-        if cc in _VIDEO_FOURCCS:
-            return cc
-        pos = i + 4
-        i = moov.find(b"stsd", pos)
-    return first
-
-
-def _hg_plain_candidates(model: Mapping[str, Any], quality: str = "1080", strict: bool = False) -> list:
-    """备用接口（codec_type=1）的标准 hvc1 直链候选。
-
-    只收非 bytevc2 且能解出地址的条目；返回 [(url, size), ...]。
-    strict=True 时只认这一档自己的清晰度，绝不跨档串用（防止 1080 被换成 720）。
-    """
-    fb = _fallback_api_value(model.get("fallback_api") if isinstance(model, Mapping) else None)
-    if not fb:
-        _hg_diag("plain", "模型里没有 fallback_api", q=quality, strict=int(bool(strict)))
-        return []
-    api = re.sub(r"codec_type=\d+", "codec_type=1", fb)
-    if "codec_type=" not in api:
-        api = api + ("&" if "?" in api else "?") + "codec_type=1"
-    j = None
-    last_status = 0
-    for _i in range(2):
-        try:
-            r = requests.get(api, headers={"User-Agent": APP_UA}, timeout=8)
-            last_status = r.status_code
-            if r.status_code == 200:
-                j = r.json()
-                if isinstance(j, Mapping):
-                    break
-            else:
-                _hg_diag("plain", "备用接口非 200", n=_i + 1, status=r.status_code,
-                         head=_hg_body_snippet(r.content, 100))
-        except Exception as exc:
-            j = None
-            _hg_diag("plain", "备用接口请求失败", n=_i + 1,
-                     code=_hg_err_code(exc), detail=exc)
-        try:
-            time.sleep(0.3)
-        except Exception:
-            pass
-    if not isinstance(j, Mapping):
-        _hg_diag("plain", "备用接口没有可用 JSON", q=quality, status=last_status)
-        return []
-    data = j
-    for key in ("video_info", "data"):
-        if isinstance(data.get(key), Mapping):
-            data = data[key]
-    if isinstance(data.get("data"), Mapping):
-        data = data["data"]
-    raw_list = data.get("video_list") or {}
-    items = list(raw_list.values()) if isinstance(raw_list, Mapping) else [x for x in raw_list if isinstance(x, Mapping)]
-    if not items:
-        _hg_diag("plain", "备用接口 video_list 为空", q=quality)
-        return []
-    seed = _key_seed_from_model(data)
-    first = _HG_Q_TO_QTYPE.get(str(quality), "1")
-    if strict:
-        order = [first]
-    else:
-        order = [first] + [q for q in ("0", "2", "1", "10", "20", "30", "40") if q != first]
-    out = []
-    seen = set()
-    for qt in order:
-        for it in items:
-            if not isinstance(it, Mapping) or _hg_entry_is_bytevc2(it):
-                continue
-            if str(it.get("quality_type") or "") != qt:
-                continue
-            raw = _text(it.get("main_url"))
-            pick = raw
-            if seed and raw and not raw.startswith("http"):
-                try:
-                    pick = _decrypt_spade_url(raw, seed) or raw
-                except Exception:
-                    pick = raw
-            if not pick.startswith("http") or pick in seen:
-                continue
-            seen.add(pick)
-            out.append((pick, int(it.get("size") or 0)))
-    _hg_diag("plain", "候选直链", q=quality, strict=int(bool(strict)), n=len(out))
-    return out
-
-
-def _hg_entry_size(item: Any) -> int:
-    """从模型条目里取字节数（video_meta.size 优先，缺了看顶层 size）。"""
-    try:
-        if not isinstance(item, Mapping):
-            return 0
-        vm = item.get("video_meta")
-        if isinstance(vm, Mapping) and vm.get("size"):
-            return int(vm.get("size") or 0)
-        return int(item.get("size") or 0)
-    except Exception:
-        return 0
-
-
-def _hg_plain_url_session(url: str, size: int = 0) -> Any:
-    """上游本就是未加密直链时，验成标准 hvc1/avc1 且中段 206 才返回直通会话。
-
-    站点对部分集数给的是 1:normal（没有 encrypt_info）：这类流不需要解密，
-    但同样不能把 bytevc2 或加密壳丢给播放器，所以沿用同一套四字符码 + 视频轨 + 中段校验。
-    """
-    if not isinstance(url, str) or not url.startswith("http"):
-        return None
-    try:
-        total, _moov_start, moov = _fetch_moov(url)
-    except Exception as exc:
-        _hg_diag("plain", "直链没有可用 moov", host=urlparse(url).netloc,
-                 code=_hg_err_code(exc), detail=exc)
-        return None
-    fourcc = _hg_moov_fourcc(moov)
-    if fourcc not in _DECODABLE_ENTRIES:
-        _hg_diag("plain", "直链编码壳不认", host=urlparse(url).netloc,
-                 fourcc=fourcc.decode("latin-1", "replace"))
-        return None
-    if not _moov_has_video_track(moov):
-        _hg_diag("plain", "直链没有视频轨", host=urlparse(url).netloc)
-        return None
-    mid = max((total or size) // 2, 1024)
-    try:
-        head = requests.get(
-            url,
-            headers={"Range": "bytes=%d-%d" % (mid, mid + 1023), "User-Agent": MEDIA_UA},
-            timeout=8,
-        )
-        if head.status_code != 206:
-            _hg_diag("plain", "直链中段不是 206", status=head.status_code,
-                     host=urlparse(url).netloc)
-            return None
-    except Exception as exc:
-        _hg_diag("plain", "直链中段请求失败", code=_hg_err_code(exc), detail=exc)
-        return None
-    _hg_diag("plain", "直链可用", host=urlparse(url).netloc, total=total or size)
-    return _PlainSession(url, total or size)
-
-
-def _hg_plain_session(model: Mapping[str, Any], quality: str = "1080", strict: bool = True) -> Any:
-    """挑一条确认是标准 hvc1/avc1、且能按 Range 取中段（可 seek）的直通流。
-
-    三条候选都验不过就返回 None，交给调用方报错重试，绝不把 bvc2 丢给播放器。
-    """
-    candidates = _hg_plain_candidates(model, quality, strict)[:3]
-    for url, size in candidates:
-        sess = _hg_plain_url_session(url, size)
-        if sess is not None:
-            return sess
-    _hg_diag("plain", "没有可用直链", q=quality, strict=int(bool(strict)), tried=len(candidates))
-    return None
-
-
 class _StreamSession:
     """按 Range 逐块拉取加密 MP4，边下边解 CENC，供本地播放器直连。"""
 
@@ -1971,59 +1312,16 @@ def _fresh_device_pair() -> tuple[str, str]:
     )
 
 
-# ---- 设备身份持久化 ----
-# 重启 App 后沿用同一台「已注册设备」，服务端信任随使用累积；
-# 每次都换新设备 = 永远零信任，容易撞风控限额（如只能看前几集）。
-_DEVICE_FILE = "hg_device.json"
-
-
-def _device_file_path() -> str:
-    try:
-        return os.path.join(_hg_cache_dir(), _DEVICE_FILE)
-    except Exception:
-        return ""
-
-
-def _load_persisted_device() -> dict[str, str] | None:
-    try:
-        path = _device_file_path()
-        if not path or not os.path.isfile(path):
-            return None
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        did = _text(data.get("device_id"))
-        iid = _text(data.get("install_id"))
-        if did.isdigit() and iid.isdigit() and did != "0" and iid != "0":
-            return {"device_id": did, "install_id": iid}
-    except Exception:
-        pass
-    return None
-
-
-def _persist_device(pair: Mapping[str, Any]) -> None:
-    try:
-        did = _text(pair.get("device_id"))
-        iid = _text(pair.get("install_id"))
-        path = _device_file_path()
-        if not (did and iid and path):
-            return
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"device_id": did, "install_id": iid}, fh)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-
 def _is_empty_model_error(err: BaseException) -> bool:
     text = str(err)
     return (
         "video_model 数据为空" in text
         or "video_model 为空" in text
         or "上游响应不是 JSON" in text
-        or "返回空响应" in text
         or "播放模型没有清晰度" in text
         or "播放模型缺少地址或密钥材料" in text
+        or "HTTP 200 空响应" in text
+        or "App 接口未返回 data" in text
     )
 
 
@@ -2031,30 +1329,24 @@ def _register_device_pair() -> tuple[str, str] | None:
     try:
         import uuid as _uuid
         openudid = "".join(random.choice("0123456789abcdef") for _ in range(16))
-        # 版本号与播放链路（APP_UA / _video_model 参数）保持一致：
-        # 同一设备注册时 73532、播放时 71332 的版本矛盾是服务端风控的明显异常点。
-        header = {"display_name": "红果免费短剧", "aid": 8662, "app_version": "7.1.3.32", "version_code": 71332, "manifest_version_code": 71332, "update_version_code": 71332, "channel": "update_64", "package": "com.phoenix.read", "app_language": "zh", "os": "Android", "os_version": "16", "os_api": 36, "device_model": "25053RT47C", "device_brand": "Redmi", "device_manufacturer": "Xiaomi", "cpu_abi": "arm64-v8a", "density_dpi": 520, "display_density": "xxhdpi", "resolution": "2772x1280", "language": "zh", "timezone": 8, "access": "wifi", "openudid": openudid, "clientudid": str(_uuid.uuid4()), "cdid": str(_uuid.uuid4()), "region": "CN", "tz_name": "Asia/Shanghai", "tz_offset": 28800, "sim_region": "cn", "device_platform": "android", "not_request_sender": 0, "is_system_app": 0, "sdk_flavor": "china", "rom": "OS2.0", "rom_version": "BP2A.250605.031.A3"}
+        header = {"display_name": "红果免费短剧", "aid": 8662, "app_version": "7.3.5.32", "version_code": 73532, "manifest_version_code": 73532, "update_version_code": 73532, "channel": "update_64", "package": "com.phoenix.read", "app_language": "zh", "os": "Android", "os_version": "16", "os_api": 36, "device_model": "25053RT47C", "device_brand": "Redmi", "device_manufacturer": "Xiaomi", "cpu_abi": "arm64-v8a", "density_dpi": 520, "display_density": "xxhdpi", "resolution": "2772x1280", "language": "zh", "timezone": 8, "access": "wifi", "openudid": openudid, "clientudid": str(_uuid.uuid4()), "cdid": str(_uuid.uuid4()), "region": "CN", "tz_name": "Asia/Shanghai", "tz_offset": 28800, "sim_region": "cn", "device_platform": "android", "not_request_sender": 0, "is_system_app": 0, "sdk_flavor": "china", "rom": "OS2.0", "rom_version": "BP2A.250605.031.A3"}
         body = json.dumps({"magic_tag": "ss_app_log", "header": header, "_gen_time": int(time.time() * 1000)}).encode("utf-8")
         qs = urlencode({"req_id": str(_uuid.uuid4()), "_rticket": int(time.time() * 1000)})
         resp = requests.post(
             "https://log.snssdk.com/service/2/device_register/?" + qs,
             data=body,
-            headers={"User-Agent": APP_UA, "Accept": "application/json", "Content-Type": "application/json; charset=utf-8"},
+            headers={"User-Agent": "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)", "Accept": "application/json", "Content-Type": "application/json; charset=utf-8"},
             timeout=20,
         )
         if resp.status_code != 200:
-            _hg_diag("device", "register 非 200", status=resp.status_code,
-                     head=_hg_body_snippet(resp.content, 120))
             return None
         data = resp.json()
         did = str(data.get("device_id_str") or data.get("device_id") or "")
         iid = str(data.get("install_id_str") or data.get("install_id") or "")
         if did.isdigit() and iid.isdigit() and did != "0" and iid != "0":
             return did, iid
-        _hg_diag("device", "register 回包没有有效 did/iid",
-                 keys=",".join(list(data.keys())[:8]) if isinstance(data, Mapping) else "-")
-    except Exception as exc:
-        _hg_diag("device", "register 异常", code=_hg_err_code(exc), detail=exc)
+    except Exception:
+        pass
     return None
 
 
@@ -2063,7 +1355,6 @@ def _rotate_stream_device() -> dict[str, str]:
     if registered is not None:
         device_id, install_id = registered
         is_registered = True
-        _persist_device({"device_id": device_id, "install_id": install_id})
     else:
         device_id, install_id = _fresh_device_pair()
         is_registered = False
@@ -2072,9 +1363,6 @@ def _rotate_stream_device() -> dict[str, str]:
         stored = dict(pair)
         stored["registered"] = is_registered
         _STREAM_STATE["device"] = stored
-    # 随机号取流必回空体，所以「这一轮用的到底是不是注册号」必须写死进日志。
-    _hg_diag("device", "adopt", registered=int(is_registered),
-             did=_hg_tail(device_id), iid=_hg_tail(install_id))
     return pair
 
 
@@ -2083,1795 +1371,67 @@ def _working_device_pair() -> dict[str, str] | None:
         pair = _STREAM_STATE.get("device")
     if isinstance(pair, dict) and pair.get("device_id") and pair.get("install_id"):
         return {"device_id": str(pair["device_id"]), "install_id": str(pair["install_id"])}
-    # 内存没有（App 刚重启）→ 恢复本机持久化的已注册设备，沿用旧身份而不是重开新号
-    persisted = _load_persisted_device()
-    if persisted is not None:
-        with _STREAM_LOCK:
-            stored = dict(persisted)
-            stored["registered"] = True
-            _STREAM_STATE["device"] = stored
-    return persisted
-
-
-# ===================== 官方 profile 签名（2026-11-24 移植自 hongguo.js） =====================
-# hongguo.js 内嵌运行时的官方签名（profile v04.10.03-ml-android）整套纯 Python 转写：
-# x-gorgon / x-khronos / x-ladon / x-argus / x-helios / x-medusa + SM3 + third 表 +
-# V5 白盒流密码（内嵌 lzma 数据表）。与 Node 原实现 42 组黄金向量（覆盖全部 16 种
-# selector 分支、GET/POST）逐字节比对一致。取流与官方取季（plan/v）共用本签名。
-_HG_PROFILE_SIGN_BLOB = (
-    "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"
-)
-_HG_PROFILE_NS = {"__name__": "hg_profile_sign"}
-exec(compile(lzma.decompress(base64.b64decode(_HG_PROFILE_SIGN_BLOB)).decode("utf-8"),
-             "hg_profile_sign", "exec"), _HG_PROFILE_NS)
-
-_HG_PROFILE_QUERY_BASE = {
-    "ac": "wifi", "channel": "update_64", "aid": "8662", "app_name": "novelread",
-    "version_code": "73932", "version_name": "7.3.9.32", "device_platform": "android",
-    "os": "android", "ssmix": "a", "device_type": "25053RT47C", "device_brand": "Redmi",
-    "language": "zh", "os_api": "36", "os_version": "16", "manifest_version_code": "73932",
-    "resolution": "1280*2772", "dpi": "520", "update_version_code": "73932",
-    "host_abi": "arm64-v8a", "dragon_device_type": "phone", "pv_player": "73932",
-    "compliance_status": "0", "need_personal_recommend": "1", "player_so_load": "1",
-    "is_android_pad_screen": "0",
-}
-
-
-def _hg_profile_canon(params):
-    """hongguo.js Ni 的等价实现：encodeURIComponent 后把 !'() 转成大写 %XX（* 保留字面）。"""
-    def _enc(value):
-        text = quote(str(value if value is not None else ""), safe="!*()")
-        return "".join(("%02X" % ord(ch)) if ch in "!'()" else ch for ch in text)
-    return "&".join("%s=%s" % (_enc(k), _enc(v)) for k, v in params.items())
-
-
-_HG_PROFILE_DEVICE_LOCK = threading.Lock()
-
-
-def _hg_profile_device():
-    """profile 签名专用设备：按官方 he 参数（73932 版本）注册，注册/查询版本一致，
-    避免与主链路 71332 设备互相干扰。失败时回退主链路设备号。"""
-    with _HG_PROFILE_DEVICE_LOCK:
-        pair = _STREAM_STATE.get("profile_device")
-        if isinstance(pair, dict) and pair.get("device_id") and pair.get("install_id"):
-            return {"device_id": str(pair["device_id"]), "install_id": str(pair["install_id"])}
-    persisted = None
-    try:
-        path = os.path.join(_hg_diag_dir() or "/sdcard/Download", "hg_device_profile.json")
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            did = _text(data.get("device_id"))
-            iid = _text(data.get("install_id"))
-            if did.isdigit() and iid.isdigit() and did != "0" and iid != "0":
-                persisted = {"device_id": did, "install_id": iid}
-    except Exception:
-        persisted = None
-    if persisted is not None:
-        with _HG_PROFILE_DEVICE_LOCK:
-            _STREAM_STATE["profile_device"] = dict(persisted)
-        return persisted
-    try:
-        import uuid as _uuid
-        cdid = str(_uuid.uuid4())
-        openudid = "".join(random.choice("0123456789abcdef") for _ in range(16))
-        header = {"aid": 8662, "app_name": "novelread", "package": "com.phoenix.read",
-                  "app_version": "7.3.9.32", "version_code": 73932, "update_version_code": 73932,
-                  "manifest_version_code": 73932, "sdk_version": "6.18.0",
-                  "device_platform": "android", "os": "Android", "os_version": "16", "os_api": 36,
-                  "device_model": "25053RT47C", "device_brand": "Redmi", "device_manufacturer": "Xiaomi",
-                  "density_dpi": 520, "display_density": "mdpi", "resolution": "1280x2772",
-                  "language": "zh", "timezone": 8, "access": "wifi", "channel": "update_64",
-                  "cdid": cdid, "openudid": openudid}
-        body = json.dumps({"magic_tag": "ss_app_log", "header": header,
-                           "_gen_time": int(time.time() * 1000)}).encode("utf-8")
-        resp = requests.post(
-            "https://log.snssdk.com/service/2/device_register/?aid=8662&app_name=novelread",
-            data=body,
-            headers={"User-Agent": APP_UA, "Content-Type": "application/json; charset=utf-8"},
-            timeout=15)
-        data = resp.json() if resp.status_code == 200 else {}
-        d = data.get("data") if isinstance(data.get("data"), dict) else data
-        did = str(d.get("device_id_str") or "")
-        iid = str(d.get("install_id_str") or "")
-        if did.isdigit() and iid.isdigit() and did != "0" and iid != "0":
-            pair = {"device_id": did, "install_id": iid}
-            try:
-                path = os.path.join(_hg_diag_dir() or "/sdcard/Download", "hg_device_profile.json")
-                tmp = path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(pair, fh)
-                os.replace(tmp, path)
-            except Exception:
-                pass
-            with _HG_PROFILE_DEVICE_LOCK:
-                _STREAM_STATE["profile_device"] = dict(pair)
-            _hg_diag("device", "profile-register", did=_hg_tail(did), iid=_hg_tail(iid))
-            return pair
-        _hg_diag("device", "profile-register 无效回包",
-                 keys=",".join(list(data.keys())[:8]) if isinstance(data, Mapping) else "-")
-    except Exception as exc:
-        _hg_diag("device", "profile-register 异常", code=_hg_err_code(exc), detail=exc)
-    return _working_device_pair()
-
-
-def _profile_sign_request(endpoint, devices, body):
-    """官方 profile 签名取流请求：he 版本参数 + selector 重试（_rticket 毫秒递增）+ 六头。"""
-    did = str(devices.get("device_id") or "")
-    iid = str(devices.get("install_id") or "")
-    params = dict(_HG_PROFILE_QUERY_BASE)
-    params.update({"iid": iid, "device_id": did})
-    epoch = int(time.time())
-    base_ms = int(time.time() * 1000)
-    query = None
-    ticket = base_ms
-    body_text = (body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray))
-                 else (str(body) if body else None))
-    for _x in range(32):
-        params["_rticket"] = str(base_ms + _x)
-        cand = _hg_profile_canon(params)
-        if _HG_PROFILE_NS["selector_mod3"]("x?" + cand, body_text, epoch) != 1:
-            query, ticket = cand, base_ms + _x
-            break
-    if query is None:
-        params["_rticket"] = str(base_ms + 31)
-        query, ticket = _hg_profile_canon(params), base_ms + 31
-    url = endpoint + "?" + query
-    headers = {
-        "User-Agent": APP_UA,
-        "Accept": "application/json; charset=utf-8,application/x-protobuf",
-        "Content-Type": "application/json; charset=UTF-8",
-        "x-xs-from-web": "0",
-        "x-ss-req-ticket": str(ticket),
-        "x-tt-request-tag": "t=0;n=0",
-        "sdk-version": "2",
-        "passport-sdk-version": "50561",
-        "x-vc-bdturing-sdk-version": "3.7.2.cn",
-        "x-ss-stub": hashlib.md5(bytes(body or b"")).hexdigest().upper(),
-        "x-tt-dt": "",
-    }
-    headers.update(_HG_PROFILE_NS["profile_sign_headers"](url, body_text, epoch, did))
-    return headers, url
-
-
-def _hg_profile_get(path, extra, devices, timeout=12):
-    """官方 GET 接口（bookapi）profile 签名。返回 dict；异常向上抛。"""
-    did = str(devices.get("device_id") or "")
-    iid = str(devices.get("install_id") or "")
-    params = dict(_HG_PROFILE_QUERY_BASE)
-    params.update({"iid": iid, "device_id": did})
-    params.update(extra or {})
-    epoch = int(time.time())
-    base_ms = int(time.time() * 1000)
-    query = None
-    ticket = base_ms
-    for _x in range(32):
-        params["_rticket"] = str(base_ms + _x)
-        cand = _hg_profile_canon(params)
-        if _HG_PROFILE_NS["selector_mod3"]("x?" + cand, None, epoch) != 1:
-            query, ticket = cand, base_ms + _x
-            break
-    if query is None:
-        params["_rticket"] = str(base_ms + 31)
-        query, ticket = _hg_profile_canon(params), base_ms + 31
-    url = "https://reading.snssdk.com" + path + "?" + query
-    headers = {
-        "User-Agent": APP_UA,
-        "Accept": "application/json; charset=utf-8,application/x-protobuf",
-        "x-xs-from-web": "0",
-        "x-ss-req-ticket": str(ticket),
-        "x-tt-request-tag": "t=0;n=0",
-        "sdk-version": "2",
-        "passport-sdk-version": "50561",
-        "x-vc-bdturing-sdk-version": "3.7.2.cn",
-        "x-tt-dt": "",
-    }
-    headers.update(_HG_PROFILE_NS["profile_sign_headers"](url, None, epoch, did))
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    return resp.json()
-
-
-def _hg_official_season_rows(sid, devices):
-    """官方取季（hongguo.js seriesSeasons 同款）：plan/v 起头 + cell/change/v 翻页，
-    返回 [{no, sid, title, cnt, subscribe}]，按季号升序。官方没给分季时返回 []。"""
-    sid = str(sid)
-    if not re.match(r"^[1-9][0-9]{9,29}$", sid):
-        return []
-    resp = _hg_profile_get("/reading/bookapi/plan/v",
-                           {"scene": 10, "from": "single_col_same_ip_series",
-                            "book_id": sid, "filter_ids": sid}, devices)
-    if str(resp.get("code")) != "0":
-        return []
-    cell = None
-    for value in (resp.get("data") or []):
-        if not isinstance(value, Mapping):
-            continue
-        rows0 = value.get("video_data")
-        if isinstance(rows0, list) and any(
-                isinstance(x, Mapping) and _int(x.get("season_index")) > 0 for x in rows0):
-            cell = value
-            break
-    if not cell:
-        return []
-    rows = {}
-    cursors = set()
-    for page in range(10):
-        for video in (cell.get("video_data") or []):
-            if not isinstance(video, Mapping):
-                continue
-            vid = str(video.get("series_id_str") or video.get("series_id") or "")
-            season = _int(video.get("season_index"))
-            title = str(video.get("title") or "").strip()
-            if not re.match(r"^[1-9][0-9]{9,29}$", vid) or not season or season > 200 or not title:
-                continue
-            rows[vid] = {"no": season, "sid": vid, "title": title,
-                         "cnt": _int(video.get("episode_cnt")),
-                         "subscribe": bool(video.get("subscribe_item"))}
-        if cell.get("has_more") is not True:
-            break
-        cursor = {"cell_id": str(cell.get("cell_id_str") or ""),
-                  "offset": _int(cell.get("next_offset")),
-                  "session_id": str(cell.get("session_id") or ""),
-                  "filter_ids": sid}
-        key = cursor["cell_id"] + ":" + str(cursor["offset"])
-        if not cursor["cell_id"] or not cursor["offset"] or key in cursors or page == 9:
-            break
-        cursors.add(key)
-        nxt = _hg_profile_get("/reading/bookapi/bookmall/cell/change/v", cursor, devices)
-        if str(nxt.get("code")) != "0" or not isinstance(nxt.get("data"), Mapping):
-            break
-        cell = nxt["data"].get("cell_view")
-        if not isinstance(cell, Mapping):
-            break
-    return sorted(rows.values(), key=lambda r: r["no"])
-
-
-def _hg_official_seasons_merged(sid, budget=9.0):
-    """合并季数（官方版，取季方式移植自 hongguo.js）：plan/v 精确拿到这部剧的全部季
-    （季号/series_id/集数），再补齐各季详情成 [(季号, sd)]，按季号升序。
-    官方只有当前一季或详情补不齐时返回 []，调用方回退到原有的搜索探测合并。"""
-    started = time.time()
-    pair = _hg_profile_device()
-    if not (isinstance(pair, dict) and pair.get("device_id") and pair.get("install_id")):
-        return []
-    devices = {"device_id": pair["device_id"], "install_id": pair["install_id"]}
-    try:
-        rows = _hg_official_season_rows(sid, devices)
-    except Exception as exc:
-        _hg_diag("season", "official-miss", sid=sid, code=_hg_err_code(exc))
-        return []
-    if not rows:
-        return []
-    _t_end = time.time() + min(float(budget or 9.0), 9.0)
-
-    def _fetch(no, rid):
-        d = _hg_sd(rid)
-        return (no, d) if isinstance(d, Mapping) and d.get("vid_list") else None
-
-    merged = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        futs = [ex.submit(_fetch, r["no"], r["sid"]) for r in rows]
-        for fut in futs:
-            try:
-                r = fut.result(timeout=max(0.5, _t_end - time.time() + 3.0))
-            except Exception:
-                r = None
-            if r:
-                merged.append(r)
-    if not merged:
-        return []
-    # 至少要包含当前这一部，否则宁可回退旧逻辑
-    if str(sid) not in {str(d.get("series_id") or "") for _, d in merged}:
-        d = _hg_sd(sid)
-        if not (isinstance(d, Mapping) and d.get("vid_list")):
-            return []
-        merged.append((1, d))
-    merged = sorted(merged, key=lambda t: (t[0] if t[0] else 1))
-    _hg_diag("season", "official-ok", sid=sid, seasons=len(merged), ms=_hg_ms(started))
-    return merged
-
-
-_SIGN_LOCK = threading.Lock()
-_SIGN_PREF: dict[str, str | None] = {"mode": None}
-
-
-_SIGN_MODES = ("profile", "hiker_medusa", "hiker", "sixgod")
-
-
-def _sign_modes_ordered() -> tuple[str, ...]:
-    """自适应签名顺序：哪种签名最近一次成功，下次就先试哪种。
-    服务端风控策略会随时间翻转（2026-11-10 实测就从只认六神翻成只认海阔），
-    固定顺序意味着翻转后每次播放都白挨一次失败请求。
-    2026-11-16 实测：multi_video_model 只认「海阔 ladon/argus + x-medusa」
-    （纯海阔、六神全套都回 200 空体），所以 hiker_medusa 默认排第一。"""
-    with _SIGN_LOCK:
-        pref = _SIGN_PREF["mode"]
-    if pref in _SIGN_MODES:
-        return (pref,) + tuple(mode for mode in _SIGN_MODES if mode != pref)
-    return _SIGN_MODES
-
-
-def _sign_pref_mark(mode: str) -> None:
-    with _SIGN_LOCK:
-        _SIGN_PREF["mode"] = mode
-
-
-_EP_PREF: dict[str, bool | None] = {"single": None}
-
-
-def _ep_modes_ordered() -> tuple[bool, bool]:
-    """端点择优：multi_video_model 与 video_model 哪个最近成功就先用哪个。
-    2026-11-11：multi_ 已停服只回空包，single 生效；保留双端点自动切换，
-    服务端再翻回去也能无感跟上。"""
-    with _SIGN_LOCK:
-        pref = _EP_PREF["single"]
-    if pref is None:
-        # 2026-11-24 实测：multi_video_model 连官方 hongguo.js 同款请求都成波回空包，
-        # single 端点稳定出流。默认先打 single，命中后由 _ep_pref_mark 记忆。
-        return (True, False)
-    return (True, False) if pref else (False, True)
-
-
-def _ep_pref_mark(single: bool) -> None:
-    with _SIGN_LOCK:
-        _EP_PREF["single"] = single
-
-
-_VIDEO_MODEL_BUDGET = 9.0     # 一次取播放模型的总时间预算（秒）
-_VIDEO_MODEL_MAX_TRIES = 6    # 最多打几次上游（旧版最多 30 次，外层还再乘 3）
+    return None
 
 
 def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
-    """按「签名 × 端点」组合取播放模型，带时间预算，每个组合的结果都进日志。
-
-    2026-11-10/11-16 实测：空体是站点侧成波出现的，且 multi_video_model 只认
-    「海阔 ladon/argus + x-medusa」。旧版这里是 5 轮 × 2 端点 × 3 签名（最多 30 次），
-    外层 _stream_session 还再重试 3 次，一次点击能打出上百个请求，播放器早超时了，
-    日志里也看不出是签名被拒还是端点停服。
-    现在：最多 6 次、9 秒，命中即返回；失败留一行汇总 + 一次对照探测。
-    """
-    last_err: BaseException | None = None
-    tried: list = []
-    started = time.time()
-    deadline = started + _VIDEO_MODEL_BUDGET
-    signs = _sign_modes_ordered()
-    endpoints = _ep_modes_ordered()
-    combos = [(sign_mode, single) for sign_mode in signs for single in endpoints]
-    config = dict(config or {})
-    for sign_mode, single in combos[:_VIDEO_MODEL_MAX_TRIES]:
-        if time.time() > deadline:
-            _hg_diag("sign", "预算用尽，停止取模型", tried=len(tried), ms=_hg_ms(started))
-            break
-        if single:
-            endpoint = VIDEO_URL_SINGLE if (len(tried) % 2 == 0) else VIDEO_URL_SINGLE_ALT
-        else:
-            endpoint = VIDEO_URL if (len(tried) % 2 == 0) else VIDEO_URL_ALT
-        combo_started = time.time()
-        try:
-            model = _video_model(video_id, config, endpoint, sign_mode, single=single)
-        except Exception as err:
-            last_err = err
-            code = _hg_err_code(err)
-            tried.append("%s/%s:%s" % ("single" if single else "multi", sign_mode, code))
-            _hg_diag(
-                "sign", "miss",
-                api=("single" if single else "multi"), sign=sign_mode,
-                host=urlparse(endpoint).netloc, code=code, ms=_hg_ms(combo_started),
-            )
-            # 断网/超时与签名、端点无关，继续打同一套组合没有意义。
-            if code in ("HG_E_TIMEOUT", "HG_E_NET"):
-                break
-            continue
-        _sign_pref_mark(sign_mode)
-        _ep_pref_mark(single)
-        _hg_diag("sign", "hit",
-                 api=("single" if single else "multi"), sign=sign_mode,
-                 ms=_hg_ms(combo_started), tried=len(tried) + 1)
-        return model
-    summary = "video_model 全部组合失败（%s）" % (",".join(tried) or "未发出请求")
-    fallback_err = HongguoPluginError(summary, code="HG_E_MODEL_EMPTY")
-    _hg_fail(
-        "video_model/all",
-        last_err if last_err is not None else fallback_err,
-        vid=video_id, tried=len(tried), ms=_hg_ms(started),
-    )
-    _hg_contrast_probe(video_id, config)
-    raise last_err if last_err is not None else fallback_err
-
-
-# ===== 空体高峰期的后台重试 =====
-# 2026-11-10 实测：站点空体是成波来的（18:41~18:43 连续 16 次、跨 80 秒全空），
-# 在播放器那一次请求里死等救不回来。失败后挂一个后台线程按秒继续试，
-# 一旦拿到非空 JSON 就把会话放进缓存，用户再点一次立刻起播。
-_WARM_LOCK = threading.Lock()
-_WARM_ACTIVE: set = set()
-_WARM_WINDOW = 180.0
-_WARM_INTERVAL = 4.0
-
-
-def _warm_burst(video_id: str, config: Mapping[str, Any], quality: str) -> None:
-    key = "%s|%s" % (video_id, quality)
-    with _WARM_LOCK:
-        if key in _WARM_ACTIVE or len(_WARM_ACTIVE) >= 2:
-            return
-        _WARM_ACTIVE.add(key)
-
-    def _run() -> None:
-        deadline = time.time() + _WARM_WINDOW
-        try:
-            while time.time() < deadline:
-                time.sleep(_WARM_INTERVAL)
-                try:
-                    _stream_session(video_id, dict(config or {}), quality)
-                except Exception:
-                    continue
-                return
-        finally:
-            with _WARM_LOCK:
-                _WARM_ACTIVE.discard(key)
-
+    # v5 优先：旧版六头签名已被上游拒收（HTTP 200 空响应），空响应不再走旧路。
     try:
-        threading.Thread(target=_run, daemon=True, name="hg-warm").start()
-    except Exception:
-        with _WARM_LOCK:
-            _WARM_ACTIVE.discard(key)
+        return _video_model_v5(video_id, config)
+    except _V5EmptyResponse:
+        raise
+    except Exception as err_v5:
+        try:
+            return _video_model(video_id, config)
+        except Exception:
+            raise err_v5
 
 
-def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "1080",
-                    force: bool = False) -> "_StreamSession":
+def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "1080") -> "_StreamSession":
     quality = quality if quality in _QUALITY_LINE_NAME_TO_Q else "1080"
     cache_key = "%s|%s" % (video_id, quality)
-    leader = False
-    event = None
-    if not force:
+    with _STREAM_LOCK:
+        sessions = _STREAM_STATE["sessions"]
+        for key in [key for key, item in sessions.items() if item.expired()]:
+            sessions.pop(key, None)
+        session = sessions.get(cache_key)
+    if session is not None:
+        return session
+    # 预热线程与播放器可能同时请求同一集；用 in-flight 事件去重，
+    # 避免重复拉 video_model 与 moov（冷启动 3~18s，重复会叠加首字节延迟）。
+    with _STREAM_LOCK:
+        inflight = _STREAM_STATE.setdefault("inflight", {})
+        event = inflight.get(cache_key)
+        leader = event is None
+        if leader:
+            event = threading.Event()
+            inflight[cache_key] = event
+    if not leader:
+        event.wait(_STREAM_INFLIGHT_WAIT)
         with _STREAM_LOCK:
-            sessions = _STREAM_STATE["sessions"]
-            for key in [key for key, item in sessions.items() if item.expired()]:
-                sessions.pop(key, None)
-            session = sessions.get(cache_key)
+            session = _STREAM_STATE["sessions"].get(cache_key)
         if session is not None:
             return session
-        # 预热线程与播放器可能同时请求同一集；用 in-flight 事件去重，
-        # 避免重复拉 video_model 与 moov（冷启动 3~18s，重复会叠加首字节延迟）。
-        with _STREAM_LOCK:
-            inflight = _STREAM_STATE.setdefault("inflight", {})
-            event = inflight.get(cache_key)
-            leader = event is None
-            if leader:
-                event = threading.Event()
-                inflight[cache_key] = event
-        if not leader:
-            event.wait(_STREAM_INFLIGHT_WAIT)
-            with _STREAM_LOCK:
-                session = _STREAM_STATE["sessions"].get(cache_key)
-            if session is not None:
-                return session
     last_err = None
-    build_started = time.time()
-    _hg_diag("session", "build", vid=video_id, q=quality,
-             did=_hg_tail(config.get("device_id") if isinstance(config, Mapping) else ""))
     try:
         # 上游偶发抖动（同一集首次 502、重试即通）——冷启动这里做短重试。
-        # 只留 2 轮：取模型那层已有 6 次组合，这里再乘 3 只会让播放器干等。
-        for _attempt in range(2):
+        for _attempt in range(3):
             try:
                 model = _video_model_rotating(video_id, config)
                 rows = _video_list_from_model(model)
                 key_seed = _key_seed_from_model(model) or ""
-                # 按模型里真实存在的档位排，按与用户所选档的接近程度降序，绝不跳档乱配。
-                # _QTYPE_TO_Q 已覆盖 2160/1440，故 4K/2K 档也能参与排序。
-                avail: list = []
-                for _row in rows:
-                    _q = _QTYPE_TO_Q.get(str(_row.get("quality_type") or "")) if isinstance(_row, Mapping) else None
-                    if _q and _q not in avail:
-                        avail.append(_q)
-                if quality not in avail:
-                    avail.insert(0, quality)
-                _rank = {q: i for i, q in enumerate(_QUALITY_ORDER)}
-                _base = _rank.get(quality, 99)
-                avail.sort(key=lambda q: (0 if q == quality else 1, abs(_rank.get(q, 99) - _base)))
-                wanted_order = avail
+                # 视轨校验：个别清晰度的流不带视轨（只有声音），
+                # 此时按清晰度顺序回退到确实带视轨的那条，避免「切到低清就没画面」。
+                wanted_order = [quality] + [q for q in _QUALITY_ORDER if q != quality]
                 seen_urls = set()
                 reason = "媒体会话创建失败"
                 probed = 0
-
-                def _take(sess: Any, want: str) -> Any:
-                    """缓存并按档位返回会话；真的降了档就在日志里说清楚。"""
-                    try:
-                        sess.quality = want
-                    except Exception:
-                        pass
-                    if want != quality:
-                        try:
-                            print(
-                                "[红果] %s 的%s档拿不到壳能解的编码，降到%s档播出"
-                                % (video_id, _Q_LABEL.get(quality, quality), _Q_LABEL.get(want, want))
-                            )
-                        except Exception:
-                            pass
-                    with _STREAM_LOCK:
-                        store = _STREAM_STATE["sessions"]
-                        while len(store) >= _STREAM_MAX_SESSIONS:
-                            store.pop(next(iter(store)), None)
-                        store[cache_key] = sess
-                    return sess
-
                 for want in wanted_order:
-                    # _select_quality 返回的是这一档实际命中的清晰度（可能低于所选档），
-                    # 后面所有判断都要按"实际拿到的档"来走，不能按"想要的档"。
-                    _hg_diag("quality", "try", vid=video_id, q=want)
-                    actual, item = _select_quality(rows, want)
-                    # 这一档是 ByteVC2：只在这一档上要标准 hvc1，不跨档串
-                    if _hg_entry_is_bytevc2(item):
-                        plain_session = None
-                        try:
-                            plain_session = _hg_plain_session(model, actual, strict=True)
-                        except Exception:
-                            plain_session = None
-                        if plain_session is not None:
-                            return _take(plain_session, actual)
-                        reason = "该档只有 bytevc2，同档 hvc1 也没取到 q=%s" % want
-                        _hg_diag("quality", "miss", q=want, why=reason)
-                        continue
-                    # 这一档本来就是标准编码：走解密路，验不过再回同一档取直通
+                    _, item = _select_quality(rows, want)
                     raw_url = _media_url(item)
                     spade = _spade_value(item)
-                    if not raw_url:
+                    if not raw_url or not spade:
                         reason = reason if reason != "媒体会话创建失败" else "播放模型缺少地址或密钥材料 q=%s" % want
-                        _hg_diag("quality", "miss", q=want, why=reason)
                         continue
                     if raw_url in seen_urls:
                         continue
@@ -3882,76 +1442,32 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
                             url = _decrypt_spade_url(raw_url, key_seed) or raw_url
                         except HongguoPluginError:
                             url = raw_url
-                    # 这一档上游没有加密材料（gear_des_key 是 1:normal、无 encrypt_info）：
-                    # 本来就是未加密直链，直通转发即可，不能再当成「缺密钥」判失败
-                    if not spade:
-                        plain_url_session = _hg_plain_url_session(url, _hg_entry_size(item))
-                        if plain_url_session is not None:
-                            return _take(plain_url_session, actual)
-                        reason = "该档未加密但验不过标准编码 q=%s" % want
-                        _hg_diag("quality", "miss", q=want, why=reason)
-                        continue
-                    total = 0
-                    moov = b""
-                    moov_start = 0
-                    try:
-                        total, moov_start, moov = _fetch_moov(url)
-                    except Exception as exc:
-                        total, moov = 0, b""
-                        _hg_diag("quality", "moov 失败", q=want,
-                                 code=_hg_err_code(exc), detail=exc)
-                    if total and _moov_has_video_track(moov):
+                    total, moov_start, moov = _fetch_moov(url)
+                    if _moov_has_video_track(moov):
                         session = _StreamSession(url, derive_content_key(spade), total, moov_start, moov)
-                        # 解密后吐给播放器的视轨必须是他认得的编码，bvc2 这种一律不交
-                        _sfc = _hg_moov_fourcc(session.moov_plain)
-                        if not _sfc or _sfc in _DECODABLE_ENTRIES:
-                            return _take(session, actual)
-                        reason = "视轨编码 %s 壳解不了 q=%s" % (_sfc.decode("latin-1"), want)
-                        _hg_diag("quality", "miss", q=want, why=reason)
-                    else:
-                        reason = "该清晰度没有视轨 q=%s" % want
-                        _hg_diag("quality", "miss", q=want, why=reason)
+                        with _STREAM_LOCK:
+                            sessions = _STREAM_STATE["sessions"]
+                            while len(sessions) >= _STREAM_MAX_SESSIONS:
+                                sessions.pop(next(iter(sessions)), None)
+                            sessions[cache_key] = session
+                        return session
+                    reason = "该清晰度没有视轨 q=%s" % want
                     probed += 1
-                    plain_session = None
-                    try:
-                        plain_session = _hg_plain_session(model, actual, strict=True)
-                    except Exception:
-                        plain_session = None
-                    if plain_session is not None:
-                        return _take(plain_session, actual)
-                    if probed >= 3:
+                    # 最多多探 2 条，避免冷启动被拖慢
+                    if probed >= 2:
                         break
-                # 全部档位走不通：备用接口(fallback_api)直通兜底——那边低清是标准 hvc1，
-                # 是壳唯一解得动的编码；此时允许跨档（strict=False），宁可降档也要能播。
-                plain_session = None
-                try:
-                    plain_session = _hg_plain_session(model, quality, strict=False)
-                except Exception:
-                    plain_session = None
-                if plain_session is not None:
-                    return _take(plain_session, quality)
                 raise HongguoPluginError(reason)
             except Exception as err:
                 last_err = err
-                code = _hg_err_code(err)
-                _hg_diag("session", "attempt", n=_attempt + 1, code=code, detail=err)
-                # 签名被拒 / 模型为空 / 缺地址：同一秒内再拿一次还是同样的空包，
-                # 交给上层回退与后台重试更划算。
-                if code in ("HG_E_SIGN_REJECTED", "HG_E_MODEL_EMPTY", "HG_E_NO_ADDR",
-                            "HG_E_TIMEOUT", "HG_E_NET"):
-                    break
                 try:
                     time.sleep(0.4 * (_attempt + 1))
                 except Exception:
                     pass
         if last_err is not None:
-            _hg_diag("session", "fail", vid=video_id, q=quality,
-                     code=_hg_err_code(last_err), ms=_hg_ms(build_started),
-                     detail=last_err)
             raise last_err
-        raise HongguoPluginError("媒体会话创建失败", code="HG_E_NO_ROUTE")
+        raise HongguoPluginError("媒体会话创建失败")
     finally:
-        if leader and event is not None:
+        if leader:
             with _STREAM_LOCK:
                 _STREAM_STATE.get("inflight", {}).pop(cache_key, None)
             event.set()
@@ -3985,64 +1501,6 @@ def _parse_range(value: str, total: int) -> Any:
     return start, end
 
 
-class _PlainSession:
-    """直通会话：上游是标准 hvc1 MP4（未加密），按 Range 原样转发。"""
-
-    def __init__(self, url: str, total: int) -> None:
-        self.url = url
-        self.total = int(total)
-        self.created = time.time()
-
-    def expired(self) -> bool:
-        return time.time() - self.created > _STREAM_TTL_SECONDS
-
-    def iter_range(self, start: int, end: int, chunk: int = 512 * 1024):
-        position = start
-        while position <= end:
-            stop = min(end, position + chunk - 1)
-            last_error = None
-            block = None
-            # 轻量重试: 网络抖动就地消化, 避免升级到昂贵的整会话重建
-            for attempt in range(3):
-                if attempt:
-                    time.sleep(0.5 * attempt)
-                try:
-                    response = requests.get(
-                        self.url,
-                        headers={
-                            "Range": "bytes=%d-%d" % (position, stop),
-                            "User-Agent": MEDIA_UA,
-                            "Referer": "https://novel.snssdk.com/",
-                        },
-                        timeout=30,
-                        stream=True,
-                    )
-                except requests.RequestException as error:
-                    last_error = error
-                    continue
-                try:
-                    if response.status_code not in (200, 206):
-                        raise HongguoPluginError("直通上游返回 %s" % response.status_code)
-                    block = b"".join(response.iter_content(64 * 1024))
-                    expected = stop - position + 1
-                    if response.status_code == 206 and len(block) < expected:
-                        raise HongguoPluginError(
-                            "直通分片长度不足 %d/%d" % (len(block), expected))
-                    last_error = None
-                    break
-                except (requests.RequestException, HongguoPluginError) as error:
-                    last_error = error
-                    block = None
-                finally:
-                    response.close()
-            if last_error is not None:
-                raise last_error
-            if block:
-                yield block
-            position = stop + 1
-
-
-
 class _StreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "hg-stream"
@@ -4069,7 +1527,6 @@ class _StreamHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(message)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.close_connection = True
         try:
             self.wfile.write(message)
         except OSError:
@@ -4080,20 +1537,6 @@ class _StreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - 标准库回调命名
         self._serve(body=True)
-
-    def do_OPTIONS(self) -> None:  # noqa: N802 - 标准库回调命名
-        # WebView/网页播放器(如 WebHTV)带 Range 的 fetch 会先发 CORS 预检,
-        # 不回应预检请求会被浏览器直接拦截——表现为永远"正在获取播放信息"。
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
-        # Chrome Private Network Access: 公网页面访问 127.0.0.1 必须带此头
-        self.send_header("Access-Control-Allow-Private-Network", "true")
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-        self.close_connection = True
 
     def _serve_danmaku(self, body: bool) -> None:
         """本机弹幕路由：/hg_dm?vid=..&sid=..&fmt=xml|json，/hg_dm_debug 自检。"""
@@ -4111,15 +1554,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
             sid = _dm_series_of(vid)
         try:
             _DM_HIT[vid] = time.time()
-            _trim_store(_DM_HIT, cap=512, max_age=86400)
         except Exception:
             pass
-        _prior = _dm_state(vid)
-        if not (_prior.get("items") or []) and _prior.get("error"):
-            # 上次是失败（多半撞了限流），播放器这次真来要，就再试一次
-            state = _dm_get(vid, sid, did, iid, wait=min(_DM_WAIT, 10), force=True)
-        else:
-            state = _dm_get(vid, sid, did, iid, wait=_DM_WAIT)
+        state = _dm_get(vid, sid, did, iid, wait=_DM_WAIT)
         items = state.get("items") or []
         if parsed.path.rstrip("/").endswith("debug"):
             payload = {
@@ -4148,35 +1585,10 @@ class _StreamHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-    def _serve_diag(self, body: bool, route: str) -> None:
-        """本机自检面：/hg_selfcheck 出 JSON，/hg_diag 出最近一次失败摘要。"""
-        if route.startswith("/hg_selfcheck"):
-            data = json.dumps(_hg_selfcheck(), ensure_ascii=False, indent=1).encode("utf-8")
-            ctype = "application/json; charset=utf-8"
-        else:
-            data = _hg_last_error_text().encode("utf-8")
-            ctype = "text/plain; charset=utf-8"
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        if not body:
-            return
-        try:
-            self.wfile.write(data)
-        except OSError:
-            pass
-
     def _serve(self, body: bool) -> None:
         route = urlparse(self.path).path
         if route.startswith("/hg_dm"):
             self._serve_danmaku(body)
-            return
-        if route.startswith("/hg_selfcheck") or route.startswith("/hg_diag"):
-            self._serve_diag(body, route)
             return
         if not route.endswith(".mp4"):
             self._fail(404, b"not found")
@@ -4185,13 +1597,6 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if not params["vid"]:
             self._fail(400, b"missing vid")
             return
-        _hg_diag("http", "request", vid=params["vid"], q=params["quality"],
-                 range=_hc_range(self.headers.get("Range")))
-        try:
-            _DM_STREAM_HIT[str(params["vid"])] = time.time()
-            _trim_store(_DM_STREAM_HIT, cap=512, max_age=86400)
-        except Exception:
-            pass
         try:
             session = _stream_session(
                 params["vid"],
@@ -4201,39 +1606,8 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 },
                 params["quality"],
             )
-        except Exception as exc:
-            # 把真实原因回吐给壳的播放日志，避免只看到一句没头没脑的
-            # media session failed 就去猜是源写错了。现在带 HG_E_* 错误码。
-            reason = str(exc or "").strip() or exc.__class__.__name__
-            code = _hg_fail(
-                "stream/session", exc,
-                vid=params["vid"], q=params["quality"],
-                range=_hc_range(self.headers.get("Range")),
-                did=_hg_tail(params["device_id"]),
-            )
-            # 空体是成波来的：这里快速失败，同时挂后台继续试，用户过 1 分钟再点就命中缓存
-            if _is_empty_model_error(exc if isinstance(exc, BaseException) else Exception(str(exc))):
-                try:
-                    _warm_burst(
-                        params["vid"],
-                        {"device_id": params["device_id"], "install_id": params["install_id"]},
-                        params["quality"],
-                    )
-                    reason = reason + "（站点正处在空体高峰，后台已在自动重试，过 1 分钟再点一次即可）"
-                except Exception:
-                    pass
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("X-HG-Error-Code", code)
-            body = ("media session failed: %s: %s" % (code, reason)).encode("utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
-            try:
-                self.wfile.write(body)
-            except OSError:
-                pass
+        except Exception:
+            self._fail(502, b"media session failed")
             return
         raw_range = self.headers.get("Range") or ""
         requested = _parse_range(raw_range, session.total)
@@ -4244,16 +1618,11 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.send_header("Connection", "close")
             self.end_headers()
-            self.close_connection = True
             return
         start, end = requested if requested else (0, session.total - 1)
         self.send_response(206 if requested else 200)
         self.send_header("Content-Type", "video/mp4")
         self.send_header("Accept-Ranges", "bytes")
-        # CORS: 网页/WebView 播放器的 fetch 需要, 原生播放器会忽略, 无副作用
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Expose-Headers",
-                         "Content-Range, Content-Length, Accept-Ranges, Content-Type")
         self.send_header("Content-Length", str(end - start + 1))
         if requested:
             self.send_header(
@@ -4261,50 +1630,14 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 "bytes %d-%d/%d" % (start, end, session.total),
             )
         self.end_headers()
-        self.close_connection = True
         if not body:
             return
-        # 断点续传式喂流: 上游分片失败(签名 URL 过期/网络抖动)时强制重建会话
-        # 拿新 URL, 从已发出的字节位置继续, 播放器无感知——根治"播到一半断流"。
-        position = start
-        rebuilds = 0
-        expected_total = session.total
         try:
-            while position <= end:
-                try:
-                    for block in session.iter_range(position, end):
-                        self.wfile.write(block)
-                        position += len(block)
-                except (BrokenPipeError, ConnectionResetError):
-                    raise
-                except Exception as exc:
-                    rebuilds += 1
-                    _hg_diag("stream", "rebuild", n=rebuilds, at=position,
-                             code=_hg_err_code(exc), detail=exc)
-                    if rebuilds > 4:
-                        raise
-                    try:
-                        session = _stream_session(
-                            params["vid"],
-                            {
-                                "device_id": params["device_id"],
-                                "install_id": params["install_id"],
-                            },
-                            params["quality"],
-                            force=True,
-                        )
-                    except Exception:
-                        time.sleep(0.6)
-                        continue
-                    if session.total != expected_total:
-                        raise HongguoPluginError("重建会话后媒体长度不一致", code="HG_E_RANGE",
-                                                 detail="%d -> %d" % (expected_total, session.total))
+            for block in session.iter_range(start, end):
+                self.wfile.write(block)
         except (BrokenPipeError, ConnectionResetError):
-            _hg_diag("stream", "播放器断开", vid=params["vid"], at=position)
             self.close_connection = True
-        except Exception as exc:
-            _hg_fail("stream/body", exc, vid=params["vid"], q=params["quality"],
-                     at=position, rebuilds=rebuilds)
+        except Exception:
             self.close_connection = True
 
 
@@ -4312,26 +1645,16 @@ def _start_stream_server() -> int:
     with _STREAM_LOCK:
         if _STREAM_STATE["port"]:
             return int(_STREAM_STATE["port"])
-        last_err = None
         for port in range(_STREAM_PORT_RANGE[0], _STREAM_PORT_RANGE[1]):
             try:
                 server = ThreadingHTTPServer(("127.0.0.1", port), _StreamHandler)
-            except OSError as exc:
-                last_err = exc
+            except OSError:
                 continue
             server.daemon_threads = True
             threading.Thread(target=server.serve_forever, daemon=True).start()
             _STREAM_STATE["port"] = port
             _STREAM_STATE["server"] = server
-            _hg_diag("server", "listen", port=port)
             return port
-        _hg_fail(
-            "server/bind",
-            HongguoPluginError(
-                "本机端口 %d-%d 全部绑定失败" % _STREAM_PORT_RANGE,
-                code="HG_E_BIND", detail=last_err,
-            ),
-        )
     return 0
 
 def _b64(value: str) -> bytes:
@@ -6246,7 +3569,7 @@ def _ror64(value: int, count: int) -> int:
     count %= 64
     return ((value >> count) | (value << (64 - count))) & 0xFFFFFFFFFFFFFFFF
 
-def _encrypt_helios(khronos: int, rand_value: int = 0) -> str:
+def _encrypt_helios(khronos: int, rand_value: int = 0, license_id: str = "1588093228") -> str:
     value = rand_value or random.randint(0, 0xFFFFFFFF)
     seed = value.to_bytes(4, "little") + b"8662"
     digest = hashlib.md5(seed).digest()
@@ -6264,7 +3587,7 @@ def _encrypt_helios(khronos: int, rand_value: int = 0) -> str:
         value2 &= 0xFFFFFFFFFFFFFFFF
         table.append(value2)
         first, second = value2, words.pop(0)
-    raw = (f"{khronos}-1588093228-8662").encode()
+    raw = (f"{khronos}-{license_id}-8662").encode()
     pad = 16 - len(raw) % 16
     raw += bytes([pad]) * pad
     output = bytearray()
@@ -6411,11 +3734,7 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
     device_id = _text(config.get("device_id"))
     install_id = _text(config.get("install_id"))
     if not device_id or not install_id:
-        raise HongguoPluginError(
-            "缺少红果 device_id/install_id 配置",
-            code="HG_E_DEVICE",
-            detail="device_id=%s install_id=%s" % (_hg_tail(device_id), _hg_tail(install_id)),
-        )
+        raise HongguoPluginError("缺少红果 device_id/install_id 配置")
     return {
         "device_id": device_id, "iid": install_id, "install_id": install_id,
         "device_brand": "Redmi", "device_model": "25053RT47C", "device_type": "25053RT47C",
@@ -6426,16 +3745,7 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
         "ua": APP_UA,
     }
 
-def _hiker_query(params: Mapping[str, Any]) -> str:
-    """海阔视界 hgPhxQuery() 的等价实现：原样拼接，不做 URL 编码（resolution 里的 * 保留字面）。"""
-    parts = []
-    for key, value in params.items():
-        parts.append("%s=%s" % (key, value))
-    return "&".join(parts)
-
-
-def _video_model(video_id: str, config: Mapping[str, Any], video_url: str | None = None,
-                 sign_mode: str = "sixgod", single: bool = False) -> dict[str, Any]:
+def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     devices = _device_config(config)
     params = {
         "iid": devices["install_id"],
@@ -6477,12 +3787,8 @@ def _video_model(video_id: str, config: Mapping[str, Any], video_url: str | None
             "use_server_dns": False,
             "video_platform": 1024,
         },
+        "mixed_video_id_map": {"1004": [video_id]},
     }
-    if single:
-        # video_model/v1/（multi_ 停服后的现行接口）：顶层 video_id
-        payload["video_id"] = video_id
-    else:
-        payload["mixed_video_id_map"] = {"1004": [video_id]}
     request_headers = {
         "User-Agent": APP_UA,
         "Accept": "application/json; charset=utf-8,application/x-protobuf",
@@ -6496,94 +3802,24 @@ def _video_model(video_id: str, config: Mapping[str, Any], video_url: str | None
     }
     if devices.get("cookie"):
         request_headers["Cookie"] = devices["cookie"]
-    endpoint = video_url or VIDEO_URL
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if sign_mode == "profile":
-        # 2026-11-24 移植：hongguo.js 官方 profile 签名（v04.10.03-ml-android）。
-        # 用 profile 专用设备（注册/查询同为 73932 版本），注册失败时回退主链路设备号。
-        _pdev = _hg_profile_device()
-        if isinstance(_pdev, dict) and _pdev.get("device_id") and _pdev.get("install_id"):
-            devices = dict(devices)
-            devices.update(_pdev)
-        signed_headers, signed_url = _profile_sign_request(endpoint, devices, body)
-    elif sign_mode in ("hiker", "hiker_medusa"):
-        # 2026-11-10 20:11 同机同网现场：海阔视界能播、狼壳空体。逐字比对两边请求，
-        # 参数、UA、body 完全一致，唯一实质差异在签名头：
-        #   海阔 FQ.signHeaders(qs, body, false, 8662, 1611921764) 只产出
-        #     x-ladon / x-argus / x-ss-stub / x-khronos / x-ss-req-ticket；
-        #   我们走 _core_sixgod，额外塞了 x-gorgon / x-medusa / x-helios / x-tt-dt
-        #     这类视频接口并不认的六神签名。本函数按海阔那套只签 ladon+argus。
-        query = _hiker_query(params)
-        _hiker_sig = _dm_sign_headers(
-            query,
-            body,
-            str(devices.get("device_id") or ""),
-            str(devices.get("install_id") or ""),
-            8662,
-            1611921764,
-        )
-        signed_headers = {
-            "User-Agent": APP_UA,
-            "Accept": "application/json; charset=utf-8,application/x-protobuf",
-            "Content-Type": "application/json",
-            "x-xs-from-web": "0",
-            "sdk-version": "2",
-        }
-        signed_headers.update(_hiker_sig)
-        if sign_mode == "hiker_medusa":
-            # 2026-11-16 实测：只发 ladon/argus 服务端回 200 空体，
-            # 在同一 khronos 下再补一个 x-medusa（内联 _gen_medusa，
-            # 与六神全套的区别是不发 x-gorgon / x-helios / x-tt-dt），
-            # multi_video_model 立即回 19KB 真数据。生成失败时降级为纯海阔。
-            try:
-                _medusa_ts = int(_hiker_sig.get("x-khronos") or time.time())
-                _medusa_url, _medusa_params = _get_params_encrypturl(endpoint, params, devices)
-                signed_headers["x-medusa"] = _gen_medusa(
-                    _medusa_url, _medusa_params, devices, payload, _medusa_ts, "application/json"
-                )
-            except Exception as exc:
-                # 静默降级成纯海阔会直接导致 200 空体，必须留痕。
-                _hg_diag("sign", "x-medusa 生成失败，降级为纯海阔",
-                         code=_hg_err_code(exc), detail=exc)
-        if devices.get("cookie"):
-            signed_headers["Cookie"] = str(devices["cookie"])
-        signed_url = endpoint + "?" + query
-    else:
-        signed_headers, signed_url = _core_sixgod(
-            endpoint,
-            params,
-            devices,
-            payload,
-            request_headers,
-        )
-    started = time.time()
-    _hg_diag(
-        "req", "video_model",
-        api=("single" if single else "multi"),
-        sign=sign_mode,
-        host=urlparse(endpoint).netloc,
-        n=len(body),
-        did=_hg_tail(devices.get("device_id")),
-        cookie=("y" if devices.get("cookie") else "n"),
-        x_tt_dt=("y" if devices.get("x_tt_dt") else "n"),
+    signed_headers, signed_url = _core_sixgod(
+        VIDEO_URL,
+        params,
+        devices,
+        payload,
+        request_headers,
     )
-    try:
-        # 签名头只记「有没有」，不落值：日志会给用户看，不能带凭据。
-        response = requests.post(
-            signed_url,
-            headers=signed_headers,
-            data=body,
-            timeout=30,
-        )
-    except Exception as exc:
-        _hg_fail("video_model/req", exc,
-                 api=("single" if single else "multi"), sign=sign_mode,
-                 host=urlparse(endpoint).netloc, ms=_hg_ms(started))
-        raise
-    response_data = _json_response(response, stage="video_model")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    response = requests.post(
+        signed_url,
+        headers=signed_headers,
+        data=body,
+        timeout=30,
+    )
+    response_data = _json_response(response)
     data = response_data.get("data") or {}
     if not isinstance(data, Mapping):
-        raise HongguoPluginError("video_model 数据为空", code="HG_E_MODEL_EMPTY")
+        raise HongguoPluginError("video_model 数据为空")
     entry: Any = data.get(video_id)
     if entry is None:
         for value in data.values():
@@ -6598,30 +3834,736 @@ def _video_model(video_id: str, config: Mapping[str, Any], video_url: str | None
     raw_model = entry.get("video_model") if isinstance(entry, Mapping) else None
     if raw_model is None:
         raw_model = data.get("video_model")
-    if raw_model is None and ("video_list" in data or "dynamic_video_list" in data):
-        raw_model = data  # video_model/v1/ 可能直接把播放模型铺在 data 顶层
     if isinstance(raw_model, str):
         try:
             raw_model = json.loads(raw_model)
         except ValueError as exc:
-            raise HongguoPluginError("video_model JSON 无效", code="HG_E_NON_JSON") from exc
+            raise HongguoPluginError("video_model JSON 无效") from exc
     if not isinstance(raw_model, Mapping):
-        raise HongguoPluginError(
-            "video_model 为空", code="HG_E_MODEL_EMPTY",
-            detail="keys=" + ",".join(list(data.keys())[:8]),
-        )
-    model = dict(raw_model)
+        raise HongguoPluginError("video_model 为空")
+    return dict(raw_model)
+
+# ==================== v5 播放签名（Android v04.10.03） ====================
+# 2026-11-16 起上游拒收旧版六头签名（x-gorgon/x-argus/x-ladon 占位版）：
+# 旧 POST /novel/player/multi_video_model/v1/ 一律回 HTTP 200 + 0 字节，
+# 本机流服务与 localProxy 都依赖它，于是全部 502/空响应。
+# 本节移植自 sunnysky123/hongguo-web（MIT，server/src/core/pure-sign.js
+# 与 service/app-source.js、service/playback-device.js，2026-11-24 版）：
+#   * 播放改走 a 域名 POST /novel/player/multi_video_model/player/v1
+#    （gzip JSON 体，只带 x-khronos / x-helios / x-medusa 三个签名头）
+#   * v5 medusa：field 21 固定为 protobuf 原值 624（zigzag 有符号 312），
+#     377 会被上游一律回空响应；helios license 换成 646637794
+#   * 空响应时用同一注册身份补一次签名 GET video_tab（b 域名），只认本集
+#   * 每次取流注册全新匿名设备身份（ttEncrypt 注册），随机身份会被软拦截
+_V5_MAGIC = bytes.fromhex("2d4b4fca49750d433fb5ae2c226dcc56")
+_V5_LICENSE = "646637794"
+_V5_FIELD21 = 312
+_V5_SIGN_KEY = bytes.fromhex(
+    "b23c2a470a20d105dc3f8c4438f8272ed46d6c89ffdcdedd5108698d26e9489d")
+_V5_SBOX = bytes.fromhex("53290fe9e51f316f90f74a7e034d367784ab49237cd0135cdc632c322fd3be0e2624a417ecd9151a7ff64f60730a87f9445ec6ada2f865d22b696c4188f24c0df37b75510b939f6bc2fe6883e68bc8c722181ba0bdb08c9871b50c9a16b46eea8eed20ba4b8a14e0fcf1468dbbef05a93e5a9d7dcf06898635c1fd99f5de287a80c594daaab19b6279fbd75070cb52eb2555c456e39e7839853874e2f0013ac0b64742d8ca10e4b79c955de8b843ce4ed464a6a72ed508091c92e7b3eedd1e1dd12afac321618fa3d65f9167c982f43d66a53c6a1997585b346dbf9672ff37cdbc073b2dae11453304df00815476b2a13fccdb30b957a8acafe127400248591238922563e36406d37a24100b7902a028044e218453c2a399199c9d13dc40c55ba67e502273850ebdc1a2e2188b8f2d9e3cb909b8c46a2a9f4a6dd93007eafa65b7b3a881aa908cc74f0ad76bbbb58617c37012ca05a469fd44e62eecf1e4272ce860c0ae5eadf99b20d8f0234174006f3f110d7657d01645d4eff8f71471cbfe1cb2f52648727bf3c9de55153e031b4d61757db63dbf7782eeafe9018a8891362fb14759ac32bab03b349aeb5a377c5156be4c8dfbe13a684bda39cf836697c894545fe0f2491acea9fc6252f4ff1e0fe72bd2df6e67a7f635e5bcc6d1a5dd951d89960887a18eb40c785cdb1f80ed42299333ab98cdd67f316cd54346585dccd759fb722789b08807cc0fda293f7e5e1819bb0353517020b31d3d00374952bea2c421e862040a9ec892a05b266b7a0d0cc316f483b81af39715657ffe32ad8de0c13077646035236ee5363e5f900e9a7cf850a81cd9960b6df73317226f99eaa6fff15cec34acb98246639b918ab2851466a7cdfc4ad1b52c2ae95a58d3734e47ddd5b7560193f644ef9c408b7dee39b4d6aabf4de761e3252d4c7ba3843187745d55e6a5db05d42b45caed43c0c5d0b64bfa9d94a4a9d8f2f0e1a108dcfd288fd2bc1fc7bd675412138169cb09249875ba3b68cfb11180afae104fc9789571c6dfce02413886796ae21e3c488cc21b9f423a066c2eabf98e2fdeeb5776e4f5d09a515ba58cbbab3e37b09fd4f6d9244df80512e84cd7956be301cf64f1429d58577cc241f3a2c655144f81aaf95a4e108da894b38970561ae9002619fbbac91fa922ed202bfc62cb08e0de2a7f3631435f8b47c8a3c563b4db4071ce74c46da6fa696a9e282d1e825d663b93bfd56c48dce1884bb10fccea063929f746443fd830a4232e53da21a1f2d1bdfebc3a02c10a1b8ad31d04fd616590d272ac737e98eb33af60528716bee78ec0ee8699031177277d9cff32542c67caf5f44591681335ae0e178f3409a7803db83892dde5b9b7f0c750e24aef077badd678a09b850b84ec1597e4963cb5e675df1c0d6fb618496ecd76c35c798325590c2fb27a5e")
+_V5_SBOX_CON2 = [[2, 0, 3, 1], [1, 3, 2, 0], [3, 2, 1, 0], [2, 3, 1, 0]]
+_V5_SBOX_ORDER = [
+    [0, 9, 14, 15, 4, 13, 2, 7, 8, 1, 6, 3, 12, 5, 10, 11],
+    [0, 9, 14, 11, 4, 13, 2, 3, 8, 1, 6, 15, 12, 5, 10, 7],
+    [0, 9, 14, 3, 4, 13, 2, 15, 8, 1, 6, 11, 12, 5, 10, 7],
+    [0, 9, 14, 15, 4, 13, 2, 3, 8, 1, 6, 11, 12, 5, 10, 7],
+]
+_V5_SBOX_INIT = [0xBBB5DE72, 0xD4638D5B, 0x92A5F73B, 0x89F8A1C9]
+_V5_WIRE = [6, 5, 3, 4, 2, 7, 1, 0]
+_V5_COMPACT = [1, 7, 3, 6, 2, 0, 4, 5]
+_V5_HASH_TABLE = [
+    0xEBB64FAF, 0x07AADCC2, 0xCF3187BF, 0xE01138FF, 0x6D0BFCFF, 0x5A30A3BE,
+    0xB41AD638, 0x34180EB8, 0xF233EB6F, 0xB1A584CC, 0xCCC30DC7, 0x47D1DB51,
+    0xD55653DE, 0x70A84FA1, 0x57473C12, 0xF76F0288, 0x2C077F0A, 0xDA0DCAD0,
+    0xFBB86F6C, 0xFDC4CF00, 0x688A020D, 0xE676C6A6, 0x8CD6338B, 0x1A3C8D0E,
+    0xCCE8B06B, 0x6AD0ED0B, 0xA0522717, 0xDC71AC83, 0x2285DB71, 0xD5B4DDA6,
+    0x736F8650, 0x6560306C, 0x617CE2A6, 0xE423417E, 0x0A40E143, 0x544E4032,
+    0x88DFFB2A, 0x716C1AE0, 0x4C467A88, 0x05B23BB3, 0xE1D0B866, 0xBAA3DCB8,
+    0xAE3374D3, 0xC3381A50, 0x1702F75B, 0xFE6DA368, 0xF0B4CF48, 0x4E0FFBB8,
+    0x72AAD10D, 0x26C53A3D, 0xF2BCE0F6, 0xB4557581, 0x4A257FDD, 0x8C3182A2,
+    0xAB0B3B86, 0x3D5DFB14, 0x4F103634, 0xD37B52D7, 0x444EFF16, 0xEB0A33D1,
+    0x6CA86F6E, 0x0284BA7, 0x08387CFA, 0x5FB37586,
+]
+# 进程级 nonce（18 随机字节的 base64url）与进程启动毫秒时间戳，供 medusa 使用。
+_V5_PROCESS_NONCE = base64.urlsafe_b64encode(os.urandom(18)).decode("ascii")
+_V5_PROCESS_STARTED = int(time.time() * 1000)
+_V5_PLAYER_API = (
+    "https://api5-normal-sinfonlinea.fqnovel.com"
+    "/novel/player/multi_video_model/player/v1"
+)
+_V5_VIDEO_TAB_API = (
+    "https://api5-normal-sinfonlineb.fqnovel.com"
+    "/reading/bookapi/video_tab/multi_video_model/v1/"
+)
+# iDuanJu 公开协议配置（2026-11-25 拉取）：
+#   https://cdn.jsdelivr.net/gh/my-name-is-alan/iDuanJu@main/configs/hongguo-protocol.json
+# 关键结论：服务端自 2026-11-23 起软拦截“全新匿名设备”（HTTP 200 空响应），
+# 播放必须用配置里给定的固定 fallback 身份 + preload/v1 端点。
+_V5_FALLBACK_IDENTITY = {
+    "device_id": "1624456208323876",
+    "iid": "1624456208327972",
+    "cdid": "91d56f7e-c027-4ce9-9a3c-229d59a13c3b",
+    "openudid": "56a962410c494bba",
+}
+_V5_PRELOAD_HOSTS = (
+    "reading.snssdk.com",
+    "api5-normal-sinfonlinea.fqnovel.com",
+    "api5-normal-sinfonlineb.fqnovel.com",
+)
+_V5_PRELOAD_PATH = "/novel/player/multi_video_model/preload/v1"
+_V5_PRELOAD_DEVICE = {
+    "aid": "8662", "app_name": "novelread", "version_code": "74532",
+    "version_name": "7.4.5.32", "update_version_code": "74532",
+    "manifest_version_code": "74532", "os": "android", "ssmix": "a",
+    "channel": "update_64", "device_platform": "android",
+    "device_type": "25053RT47C", "device_brand": "Redmi",
+    "os_version": "16", "os_api": "36", "ac": "wifi", "language": "zh",
+    "host_abi": "arm64-v8a",
+}
+_V5_PRELOAD_UA = (
+    "com.phoenix.read/74532 (Linux; U; Android 16; zh_CN; 25053RT47C; "
+    "Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 "
+    "QuicVersion:c67e9834 2025-09-08)"
+)
+_V5_PLAYER_UA = (
+    "com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; "
+    "PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)"
+)
+_V5_VIDEO_UA = (
+    "com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; "
+    "Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 "
+    "QuicVersion:c67e9834 2025-09-08)"
+)
+_V5_PLAYER_DEVICE = {
+    "aid": "8662",
+    "app_name": "novelread",
+    "version_code": "74332",
+    "version_name": "7.4.3.32",
+    "channel": "vivo_8662_64",
+    "device_platform": "android",
+    "device_type": "PGT-AN10",
+    "os_version": "12",
+    "update_version_code": "74332",
+}
+_V5_TAB_DEVICE = {
+    "ac": "wifi",
+    "channel": "update_64",
+    "aid": "8662",
+    "app_name": "novelread",
+    "version_code": "73932",
+    "version_name": "7.3.9.32",
+    "device_platform": "android",
+    "os": "android",
+    "ssmix": "a",
+    "device_type": "25053RT47C",
+    "device_brand": "Redmi",
+    "language": "zh",
+    "os_api": "36",
+    "os_version": "16",
+    "manifest_version_code": "73932",
+    "resolution": "1280*2772",
+    "dpi": "520",
+    "update_version_code": "73932",
+    "host_abi": "arm64-v8a",
+    "dragon_device_type": "phone",
+    "pv_player": "73932",
+    "compliance_status": "0",
+    "need_personal_recommend": "1",
+    "player_so_load": "1",
+    "is_android_pad_screen": "0",
+}
+_V5_REGISTER_URL = (
+    "https://log5-applog-lf.fqnovel.com/service/2/device_register/"
+    "?tt_data=a&cronet_version=8d40f833_2026-03-03"
+    "&ttnet_version=4.2.243.31-douyin&use_store_region_cookie=1"
+)
+_V5_KDF_SALT = bytes.fromhex(
+    "4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524"
+    "f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58"
+)
+_V5_REGISTER_UA = (
+    "com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; "
+    "Build/BP2A.250605.031.A3)"
+)
+_V5_PACE_LOCK = threading.Lock()
+_V5_LAST_FETCH_MS = [0]
+
+
+class _V5EmptyResponse(HongguoPluginError):
+    """v5 播放接口的 HTTP 200 空响应（可尝试 video_tab 恢复）。"""
+
+    def __init__(self, message: str, backoff: bool = False) -> None:
+        super().__init__(message)
+        self.backoff = backoff
+
+
+class _AesV3V5:
+    """AesV3 的 v5 变体：S 盒/换表/初值/位抽吸映射均为 v5 常量。"""
+
+    def __init__(self, key: bytes, khronos: int) -> None:
+        self.word_size = khronos & 3
+        self.box = _V5_SBOX[self.word_size * 256:(self.word_size + 1) * 256]
+        self.con2 = _V5_SBOX_CON2[self.word_size]
+        self.order = _V5_SBOX_ORDER[self.word_size]
+        self.wire = _V5_WIRE
+        self.compact = _V5_COMPACT
+        init = _V5_SBOX_INIT[self.word_size]
+        initial = bytearray(16)
+        for i in range(4):
+            initial[i * 4:i * 4 + 4] = (init & 0xFFFFFFFF).to_bytes(4, "little")
+        mk = bytearray(a ^ b for a, b in zip(initial, key))
+        expanded = bytearray(mk) + bytearray(32)
+        rounds = 8
+        for i in range(4, 12):
+            at = 4 * (i - 1)
+            a, b, c, d = expanded[at], expanded[at + 1], expanded[at + 2], expanded[at + 3]
+            if (i & 3) == 0:
+                t = ((((init & 0xFFFFFFFF) >> (rounds & 24)) ^ self.box[b]) & 0xFF)
+                b = self.box[c]
+                c = self.box[d]
+                d = self.box[a]
+                a = t
+            rounds += 2
+            expanded[at + 4] = (a ^ expanded[at - 12]) & 0xFF
+            expanded[at + 5] = (b ^ expanded[at - 11]) & 0xFF
+            expanded[at + 6] = (c ^ expanded[at - 10]) & 0xFF
+            expanded[at + 7] = (d ^ expanded[at - 9]) & 0xFF
+        self.keys = [list(expanded[i * 4:i * 4 + 4]) for i in range(12)]
+
+    def _sub_keys(self, start: int) -> list[list[int]]:
+        return [self.keys[start + i][:] for i in range(4)]
+
+    @staticmethod
+    def _add(rows: list[list[int]], key: list[list[int]]) -> None:
+        for i in range(4):
+            for j in range(4):
+                rows[i][j] ^= key[i][j]
+
+    def _add_con(self, rows: list[list[int]], ks: list[list[int]]) -> None:
+        for i in range(4):
+            for j in range(4):
+                rows[i][j] ^= ks[i][self.con2[j]]
+
+    def _sub(self, rows: list[list[int]]) -> None:
+        for i in range(4):
+            for j in range(4):
+                rows[i][j] = self.box[rows[i][j]] & 0xFF
+        old = [row[:] for row in rows]
+        for i in range(4):
+            rows[i] = old[self.con2[i]]
+
+    def _shift(self, rows: list[list[int]]) -> None:
+        flat = [rows[i][j] for i in range(4) for j in range(4)]
+        for i in range(16):
+            rows[i // 4][i % 4] = flat[self.order[i]] & 0xFF
+
+    def _shift_con(self, rows: list[list[int]]) -> None:
+        old = [row[:] for row in rows]
+        for i in range(4):
+            for j in range(4):
+                rows[i][j] = old[i][self.con2[j]]
+
+    @staticmethod
+    def _mix(rows: list[list[int]]) -> None:
+        for i in range(4):
+            t = rows[0][i] ^ rows[1][i] ^ rows[2][i] ^ rows[3][i]
+            u = rows[0][i]
+            rows[0][i] ^= t ^ _AesV3V5._xt(rows[0][i] ^ rows[1][i])
+            rows[1][i] ^= t ^ _AesV3V5._xt(rows[1][i] ^ rows[2][i])
+            rows[2][i] ^= t ^ _AesV3V5._xt(rows[2][i] ^ rows[3][i])
+            rows[3][i] ^= t ^ _AesV3V5._xt(rows[3][i] ^ u)
+
+    @staticmethod
+    def _xt(x: int) -> int:
+        return ((x << 1) ^ (0x1B if (x & 128) else 0)) & 0xFF
+
+    def _block(self, value: bytes) -> bytes:
+        rows = [[value[i * 4 + j] & 0xFF for j in range(4)] for i in range(4)]
+        self._add_con(rows, self._sub_keys(0))
+        for i in range(1, 3):
+            self._sub(rows)
+            self._shift(rows)
+            if i == 1:
+                self._shift_con(rows)
+                self._mix(rows)
+            self._add_con(rows, self._sub_keys(i * 4))
+        self._add(rows, self._sub_keys(4))
+        return bytes(rows[i][j] & 0xFF for i in range(4) for j in range(4))
+
+    def encrypt(self, data: bytes, iv: bytes) -> bytes:
+        wire = self.wire
+        compact = self.compact
+        plaintext = bytearray(32)
+        for i in range(31):
+            at = i * 8
+            acc = 0
+            for j in range(8):
+                src = data[at + j] if at + j < len(data) else 0
+                acc |= (((src >> wire[j]) & 1) << compact[j])
+            plaintext[i] = acc & 0xFF
+        plaintext[31] = 1
+        blocks = []
+        previous = bytes(iv)
+        for i in range(0, 32, 16):
+            value = self._block(bytes(a ^ b for a, b in zip(plaintext[i:i + 16], previous)))
+            blocks.append(value)
+            previous = value
+        key = b"".join(blocks)
+        out = bytearray(data)
+        for i in range(31):
+            at = i * 8
+            k = key[i] & 0xFF
+            for j in range(8):
+                bit = wire[j]
+                mask = (1 << bit) & 0xFF
+                idx = at + j
+                if 0 <= idx < len(out):
+                    out[idx] = (out[idx] & ((~mask) & 0xFF)) | (((k >> compact[j]) & 1) << bit)
+        return key[-1:] + bytes(out)
+
+
+def _hash_f13_v5(query_sm3: bytes, body_md5: bytes, ts_bytes: bytes, khronos: int) -> bytes:
+    iv_v1 = 0x9D4A97C2
+    count_v1 = (iv_v1 + khronos + 1) & 0xFF
+    count_v2 = (iv_v1 + khronos) & 0xFFFFFFFF
+    tt = [ror32(x, count_v1) for x in _V5_HASH_TABLE]
+    n0 = (count_v2 + 2) & 7
+    seed = bytes([0xFA, 0x45, 0x61, 0xD7])
+    pad = bytes((((seed[i] | (seed[i] << 8)) >> n0) & 0xFF) for i in range(4))
+    data = query_sm3 + body_md5 + ts_bytes + pad + bytes.fromhex("00000000000001a0")
+    di = [0] * ((len(data) // 4) + 112 + 16)
+    di_len = 0
+    for i in range(0, len(data) - 3, 4):
+        di[di_len] = int.from_bytes(data[i:i + 4], "big")
+        di_len += 1
+    di0 = di[0]
+    for i in range(112):
+        di1 = di[i + 1]
+        di14 = di[i + 14]
+        r1 = rol(di1, 14) ^ rol(di1, 25) ^ (di1 >> 3)
+        r2 = rol(di14, 13) ^ rol(di14, 15) ^ (di14 >> 10)
+        di[di_len] = (di0 + di[i + 9] + r1 + r2) & 0xFFFFFFFF
+        di_len += 1
+        di0 = di1
+    init_raw = [
+        0x7ABA4FC8, 0x67166507, 0x6403FA00, 0x340F512F,
+        984304912, 3005047866, 2874125293, 2152413264,
+    ]
+    init = [ror32(x, count_v2 & 31) for x in init_raw]
+    chosen = [96, 1, 3, 4, 0, 6, 5, 2, 0, 7, 7]
+    d = list(init)
+    for i in range(chosen[0]):
+        base = (iv_v1 + i) & 0xFFFFFFFF
+        n0v = di[base & 127]
+        n1 = ((d[chosen[3]] ^ d[chosen[4]]) & d[chosen[1]]) ^ d[chosen[3]]
+        n2 = rol(d[chosen[1]], 26) ^ rol(d[chosen[1]], 21) ^ rol(d[chosen[1]], 7)
+        n4 = (n0v + n1 + n2 + tt[base & 63] + d[chosen[5]]) & 0xFFFFFFFF
+        n5 = rol(d[chosen[2]], 30) ^ rol(d[chosen[2]], 19) ^ rol(d[chosen[2]], 10)
+        n6 = (d[chosen[2]] & d[chosen[6]]) | ((d[chosen[2]] | d[chosen[6]]) & d[chosen[7]])
+        n7 = (n5 + n6) & 0xFFFFFFFF
+        old = d[chosen[9]]
+        last = d[-1]
+        for k in range(len(d) - 1, 0, -1):
+            d[k] = d[k - 1]
+        d[0] = last
+        d[chosen[10]] = (n7 + n4) & 0xFFFFFFFF
+        d[chosen[8]] = (old + n4) & 0xFFFFFFFF
+    ret = bytearray(32)
+    for i in range(8):
+        ret[i * 4:i * 4 + 4] = ((d[i] + init[i]) & 0xFFFFFFFF).to_bytes(4, "big")
+    for i in range(16):
+        ret[i] ^= ret[i + 16]
+    return bytes(ret[:16]) + ((sum_md5(bytes(ret[:16])) | 0x20) & 0xFFFFFFFF).to_bytes(4, "little")
+
+
+def _branch_v5(query_str: str, body: bytes | None, khronos: int) -> int:
+    body_md5 = hashlib.md5(body).digest() if body else bytes(16)
+    q = SM3(query_str.encode("utf-8")).digest()
+    iv = get_iv(get_iv(get_iv(0x20230928, q), body_md5),
+                (khronos & 0xFFFFFFFF).to_bytes(4, "little"))
+    return 0 if (iv & 15) == 12 else 1
+
+
+def _medusa_v5(url: str, body: bytes | None, khronos: int, who: Mapping[str, Any]) -> str:
+    body_md5 = hashlib.md5(body).digest() if body else bytes(16)
+    query = url.split("?", 1)[1] if "?" in url else ""
+    query_sm3 = SM3(query).digest()
+    ts = (khronos & 0xFFFFFFFF).to_bytes(4, "little")
+    f13 = _hash_f13_v5(query_sm3, body_md5, ts, khronos)
+    version = str(who["version_name"])
+    device_info = _proto([
+        (1, 1, "sint32"), (2, 2, "sint32"), (3, "8662", "string"),
+        (4, str(who["device_id"]), "string"), (5, _V5_PROCESS_NONCE, "string"),
+        (6, "!noperm!", "string"), (12, "Asia/Shanghai,8", "string"),
+        (13, "zh_CN", "string"), (22, str(who["os_version"]), "string"),
+        (25, _V5_PROCESS_STARTED, "sint64"),
+        (30, str(who["device_type"]), "string"), (31, "HONOR", "string"),
+        (32, str(who["device_type"]), "string"), (34, "HONOR", "string"),
+    ])
+    env = _proto([
+        (6, "v04.10.03.04-bugfix", "string"), (8, str(who["channel"]), "string"),
+        (12, device_info, "message"), (14, version, "string"),
+    ])
+    message = _proto([
+        (1, _V5_MAGIC, "bytes"), (2, 5, "sint32"),
+        (3, random.randint(0, 0xFFFFFFFF), "sint32"),
+        (4, "8662", "string"), (5, str(who["device_id"]), "string"),
+        (6, _V5_LICENSE, "string"), (7, version, "string"),
+        (8, "v04.10.03-ml-android", "string"), (9, 0x040A0300, "sint32"),
+        (10, bytes(8), "bytes"), (12, khronos, "sint32"), (13, f13, "bytes"),
+        (14, query_sm3[:6], "bytes"),
+        (15, _proto([(1, 1, "sint32"), (2, 1, "sint32"), (3, 1, "sint32"),
+                     (5, 1, "sint32")]), "message"),
+        (17, khronos, "sint32"), (20, "none", "string"),
+        (21, _V5_FIELD21, "sint32"), (23, env, "message"),
+        (24, '{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,'
+              '"dyn":"","do":1,"tk":true}', "string"),
+    ])
+    nonce = random.randint(0, 0xFFFFFFFF)
+    key, seed = get_key_hash(_V5_SIGN_KEY, nonce)
+    transformed = _xmxor(message, key)
+    transformed = bytes(8) + bytes(transformed)
+    transformed = bytearray(transformed[::-1])
+    for i in range(len(transformed)):
+        transformed[i] ^= seed[(~i) & 3]
+    check = (((query_sm3[0] & 63) << 14) | 0x18000001 | ((f13[0] & 63) << 8)) & 0xFFFFFFFF
+    xm_rand = random.randint(0, 0xFFFFFFFF)
+    packed = (
+        b"\xca" + (xm_rand & 0xFFFFFFFF).to_bytes(4, "little")
+        + check.to_bytes(4, "little") + bytes(transformed)
+        + bytes([(nonce >> 16) & 0xFF, (nonce >> 24) & 0xFF])
+    )
+    encrypted = _AesV3V5(
+        hashlib.md5(_V5_SIGN_KEY[:16]).digest(), khronos
+    ).encrypt(packed, hashlib.md5(_V5_SIGN_KEY[16:32]).digest())
+    prefix = bytearray((5).to_bytes(4, "little") + _V5_MAGIC)
+    for i in range(len(prefix)):
+        prefix[i] ^= ts[i & 3]
+    return base64.b64encode(
+        bytes(prefix) + bytes([nonce & 0xFF, (nonce >> 8) & 0xFF, 0, 1]) + encrypted
+    ).decode("ascii")
+
+
+def _v5_encode(value: Any) -> str:
+    return quote(str(value), safe="!~*'()").replace("!", "%21").replace(
+        "'", "%27").replace("(", "%28").replace(")", "%29")
+
+
+def _sign_playback_v5(base: str, values: Mapping[str, Any],
+                      body: bytes | None, now_ms: int) -> tuple[str, dict[str, str]]:
+    ts = int(now_ms // 1000)
+    for offset in range(1024):
+        ticket = int(now_ms) + offset
+        merged = dict(values)
+        merged["_rticket"] = str(ticket)
+        query = "&".join(
+            _v5_encode(k) + "=" + _v5_encode(v) for k, v in merged.items())
+        if _branch_v5(query, body, ts) != 0:
+            continue
+        url = base + "?" + query
+        headers = {
+            "x-khronos": str(ts),
+            "x-helios": _encrypt_helios(ts, 0, _V5_LICENSE),
+            "x-medusa": _medusa_v5(url, body, ts, values),
+        }
+        if body:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+            headers["x-ss-stub"] = hashlib.md5(body).hexdigest().upper()
+        return url, headers
+    raise HongguoPluginError("无法生成播放签名")
+
+
+def _register_playback_device() -> dict[str, str]:
+    """ttEncrypt 匿名设备注册：每次取流用全新身份（随机身份会被软拦截）。"""
+    import gzip as _gzip
+    import uuid as _uuid
+
+    now = int(time.time() * 1000)
+    cdid = str(_uuid.uuid4())
+    header = {
+        "display_name": "红果免费短剧", "update_version_code": 73932,
+        "manifest_version_code": 73932, "app_version_minor": "7.3.9.32",
+        "aid": 8662, "channel": "update_64", "package": "com.phoenix.read",
+        "app_version": "7.3.9.32", "version_code": 73932,
+        "sdk_version": "3.7.0-rc.34-fanqie-xiaoshuo", "sdk_target_version": 29,
+        "git_hash": "3a88f4e", "os": "Android", "os_version": "16", "os_api": 36,
+        "device_model": "25053RT47C", "device_brand": "Redmi",
+        "device_manufacturer": "Redmi", "cpu_abi": "arm64-v8a",
+        "release_build": "b5e187f", "density_dpi": 520, "display_density": "mdpi",
+        "resolution": "1280x2772", "language": "zh", "timezone": 8,
+        "access": "wifi", "not_request_sender": 0, "carrier": "CHINA MOBILE",
+        "mcc_mnc": "46000", "rom": "eng.root.20231116.160340",
+        "rom_version": "W528JS release-keys", "cdid": cdid,
+        "sig_hash": "56a962410c494bbaf0b58dba20cae56f", "openudid": os.urandom(8).hex(),
+        "clientudid": str(_uuid.uuid4()), "ipv6_list": [], "region": "CN",
+        "tz_name": "Asia/Shanghai", "tz_offset": 28800, "sim_region": "cn",
+        "sim_serial_number": [], "oaid_may_support": False,
+        "req_id": str(_uuid.uuid4()), "device_platform": "android",
+        "custom": {"account_region_src": "fallback", "account_region": "cn",
+                   "host_bit": 64, "dragon_device_type": "phone"},
+        "pre_installed_channel": "", "apk_first_install_time": now,
+        "is_system_app": 0, "sdk_flavor": "china", "guest_mode": 0,
+    }
+    compressed = _gzip.compress(json.dumps(
+        {"magic_tag": "ss_app_log", "header": header, "_gen_time": now},
+        ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    rand = os.urandom(32)
+    derived = hashlib.sha512(
+        hashlib.sha512(rand).digest() + _V5_KDF_SALT).digest()
+    plaintext = hashlib.sha512(compressed).digest() + compressed
+    body = (bytes.fromhex("746305100000") + rand
+            + _dm_aes_cbc_encrypt(derived[:16], derived[16:32], _dm_pkcs7(plaintext)))
+    resp = requests.post(
+        _V5_REGISTER_URL, data=body, timeout=8, allow_redirects=False,
+        headers={
+            "User-Agent": _V5_REGISTER_UA,
+            "Accept": "application/json",
+            "Content-Type": "application/octet-stream;tt-data=a",
+            "log-encode-type": "gzip",
+            "x-ss-dp": "8662",
+            "x-ss-req-ticket": str(now),
+            "x-vc-bdturing-sdk-version": "4.0.3.cn",
+            "lc": "101",
+            "sdk-version": "2",
+            "passport-sdk-version": "5051452",
+            "x-neptune": "-8|50:51:59:30:40:47:49:39",
+            "x-ss-stub": hashlib.md5(body).hexdigest().upper(),
+        },
+    )
+    if resp.status_code != 200:
+        raise HongguoPluginError("匿名播放设备注册失败：HTTP %s" % resp.status_code)
     try:
-        rows = model.get("video_list") or model.get("dynamic_video_list") or []
-        _hg_diag(
-            "ok", "video_model",
-            api=("single" if single else "multi"), sign=sign_mode,
-            ms=_hg_ms(started), rows=(len(rows) if isinstance(rows, (list, tuple)) else 0),
-            keys=len(model.keys()),
-        )
+        data = resp.json()
+    except ValueError:
+        raise HongguoPluginError("匿名播放设备注册失败：响应不是 JSON") from None
+    if not isinstance(data, Mapping):
+        raise HongguoPluginError("匿名播放设备注册失败：响应格式错误")
+    device_id = str(data.get("device_id_str") or data.get("device_id") or "")
+    iid = str(data.get("install_id_str") or data.get("install_id") or "")
+    code = int(data.get("code", data.get("Code", 0)) or 0)
+    if not device_id.isdigit() or not iid.isdigit() or code != 0:
+        raise HongguoPluginError("匿名播放设备注册失败：无效的注册响应")
+    return {"device_id": device_id, "iid": iid, "cdid": cdid}
+
+
+def _v5_pace() -> None:
+    """两次播放取流至少间隔 1 秒（上游 6.9 同款节奏）。"""
+    with _V5_PACE_LOCK:
+        now = int(time.time() * 1000)
+        wait = _V5_LAST_FETCH_MS[0] + 1000 - now
+        if wait > 0:
+            time.sleep(wait / 1000.0)
+        _V5_LAST_FETCH_MS[0] = int(time.time() * 1000)
+
+
+def _extract_v5_model(payload: Mapping[str, Any], video_id: str) -> dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise HongguoPluginError("App 接口未返回 data")
+    entries = data.get("1004")
+    if not isinstance(entries, Mapping):
+        entries = data
+    entry = entries.get(str(video_id)) if isinstance(entries, Mapping) else None
+    if not isinstance(entry, Mapping) or not entry:
+        raise HongguoPluginError("App 接口未返回所选分集")
+    raw_model = entry.get("video_model")
+    if isinstance(raw_model, str):
+        try:
+            raw_model = json.loads(raw_model)
+        except ValueError:
+            raise HongguoPluginError("video_model JSON 无效") from None
+    if not isinstance(raw_model, Mapping) or not raw_model:
+        raise HongguoPluginError("video_model 为空")
+    return dict(raw_model)
+
+
+def _video_model_v5_tab(video_id: str, identity: Mapping[str, str]) -> dict[str, Any]:
+    """空响应恢复：同一注册身份签名 GET video_tab，只认本集。"""
+    vid = str(video_id)
+    values = dict(_V5_TAB_DEVICE)
+    values.update({
+        "iid": identity["iid"], "cdid": identity["cdid"],
+        "device_id": identity["device_id"], "video_id": vid,
+        "video_id_type": "0", "device_level": "1",
+        "need_all_video_definition": "1", "need_mp4_align": "0",
+        "use_os_player": "0", "video_platform": "1024",
+        "source": "0", "from_video_id": "",
+    })
+    url, headers = _sign_playback_v5(
+        _V5_VIDEO_TAB_API, values, None, int(time.time() * 1000))
+    req_headers = {
+        "User-Agent": _V5_VIDEO_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    req_headers.update(headers)
+    resp = requests.get(url, headers=req_headers, timeout=15, allow_redirects=False)
+    if resp.status_code != 200:
+        raise HongguoPluginError("App 接口 HTTP %s" % resp.status_code)
+    text = resp.text or ""
+    if not text.strip():
+        raise _V5EmptyResponse("video_tab 空响应")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        raise _V5EmptyResponse("video_tab 响应不是 JSON") from None
+    if not isinstance(payload, Mapping):
+        raise _V5EmptyResponse("video_tab 响应格式错误")
+    code = int(payload.get("Code", payload.get("code", 0)) or 0)
+    if code != 0:
+        raise HongguoPluginError("App 接口暂未提供本集播放信息")
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise _V5EmptyResponse("video_tab 未返回 data")
+    rows = data.get("video_model_data")
+    if not isinstance(rows, Mapping):
+        rows = data
+    entry = rows.get(vid) if isinstance(rows, Mapping) else None
+    if not isinstance(entry, Mapping):
+        raise _V5EmptyResponse("video_tab 未返回所选分集")
+    raw_model = entry.get("video_model")
+    if isinstance(raw_model, str):
+        try:
+            raw_model = json.loads(raw_model)
+        except ValueError:
+            raise _V5EmptyResponse("video_model JSON 无效") from None
+    if not isinstance(raw_model, Mapping) or not raw_model:
+        raise _V5EmptyResponse("video_tab 未返回 video_model")
+    return dict(raw_model)
+
+
+def _video_model_v5_preload(video_id: str, identity: Mapping[str, str]) -> dict[str, Any]:
+    """preload/v1 播放取流（固定 fallback 身份，逐 host 试）。
+    服务端软拦截全新匿名设备，preload + 固定身份是当前唯一可用路径。"""
+    import gzip as _gzip
+
+    vid = str(video_id)
+    payload = {
+        "biz_param": {
+            "detail_page_version": 0, "device_level": 2,
+            "disable_digg_stat": False, "disable_video_relate_book": False,
+            "need_all_video_definition": True, "need_mp4_align": False,
+            "use_os_player": False, "use_server_dns": False,
+            "video_platform": 1024,
+        },
+        "mixed_video_id_map": {"1004": [vid]},
+        "dr_scene": "preload",
+    }
+    body = _gzip.compress(json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    values = dict(_V5_PRELOAD_DEVICE)
+    values["iid"] = identity["iid"]
+    values["cdid"] = identity["cdid"]
+    values["device_id"] = identity["device_id"]
+    last_err = None
+    for host in _V5_PRELOAD_HOSTS:
+        base = "https://" + host + _V5_PRELOAD_PATH
+        try:
+            url, headers = _sign_playback_v5(
+                base, values, body, int(time.time() * 1000))
+        except Exception as exc:
+            last_err = exc
+            continue
+        req_headers = {
+            "User-Agent": _V5_PRELOAD_UA,
+            "Accept": "application/json",
+            "Content-Encoding": "gzip",
+        }
+        req_headers.update(headers)
+        try:
+            resp = requests.post(url, headers=req_headers, data=body,
+                                 timeout=15, allow_redirects=False)
+        except Exception as exc:
+            last_err = exc
+            continue
+        if resp.status_code != 200:
+            last_err = HongguoPluginError("App 接口 HTTP %s" % resp.status_code)
+            continue
+        text = resp.text or ""
+        if not text.strip():
+            last_err = _V5EmptyResponse("preload 空响应")
+            continue
+        try:
+            data = json.loads(text)
+        except ValueError:
+            last_err = HongguoPluginError("上游响应不是 JSON")
+            continue
+        if not isinstance(data, Mapping):
+            last_err = HongguoPluginError("App 接口未返回 data")
+            continue
+        code = int(data.get("Code", data.get("code", 0)) or 0)
+        if code != 0:
+            last_err = HongguoPluginError("App 接口暂未提供本集播放信息")
+            continue
+        return _extract_v5_model(data, vid)
+    if last_err is not None:
+        raise last_err
+    raise _V5EmptyResponse("preload 无可用 host")
+
+
+def _video_model_v5(video_id: str, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """v5 播放取流：优先 preload/v1 + 固定 fallback 身份（2026-11-25 起唯一可用路径）；
+    失败时回退到旧 player/v1 + 全新注册身份，再回退 video_tab。"""
+    import gzip as _gzip
+
+    _v5_pace()
+    vid = str(video_id)
+    try:
+        return _video_model_v5_preload(vid, _V5_FALLBACK_IDENTITY)
     except Exception:
         pass
-    return model
+    identity = _register_playback_device()
+    payload = {
+        "biz_param": {
+            "detail_page_version": 0, "device_level": 1,
+            "disable_digg_stat": False, "disable_video_relate_book": False,
+            "need_all_video_definition": True, "need_mp4_align": False,
+            "use_os_player": False, "use_server_dns": False,
+            "video_platform": 1024,
+        },
+        "mixed_video_id_map": {"1004": [vid]},
+        "dr_scene": "player",
+    }
+    body = _gzip.compress(json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    values = dict(_V5_PLAYER_DEVICE)
+    values["iid"] = identity["iid"]
+    values["cdid"] = identity["cdid"]
+    values["device_id"] = identity["device_id"]
+    url, headers = _sign_playback_v5(
+        _V5_PLAYER_API, values, body, int(time.time() * 1000))
+    req_headers = {
+        "User-Agent": _V5_PLAYER_UA,
+        "Accept": "application/json",
+        "Content-Encoding": "gzip",
+    }
+    req_headers.update(headers)
+    resp = requests.post(url, headers=req_headers, data=body,
+                         timeout=15, allow_redirects=False)
+    if resp.status_code != 200:
+        raise HongguoPluginError("App 接口 HTTP %s" % resp.status_code)
+    text = resp.text or ""
+    if not text.strip():
+        err = _V5EmptyResponse(
+            "App 接口未返回 data（HTTP 200 空响应）",
+            backoff=bool(resp.headers.get("Retry-After")),
+        )
+        if not err.backoff:
+            try:
+                return _video_model_v5_tab(vid, identity)
+            except Exception:
+                raise err from None
+        raise err
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise HongguoPluginError("上游响应不是 JSON") from None
+    if not isinstance(data, Mapping):
+        raise HongguoPluginError("App 接口未返回 data")
+    code = int(data.get("Code", data.get("code", 0)) or 0)
+    if code != 0:
+        raise HongguoPluginError("App 接口暂未提供本集播放信息")
+    return _extract_v5_model(data, vid)
+
 
 def _video_list_from_model(model: Mapping[str, Any]) -> Any:
     for key in ("video_list", "dynamic_video_list"):
@@ -6728,11 +4670,7 @@ def _select_quality(video_list: Any, wanted: str = "1080") -> tuple[str, dict[st
     # 无法识别清晰度时用 idxN 兜底成唯一 key，保证每条候选都被保留（不再互相覆盖）
     for index, (hinted_quality, item) in enumerate(candidates):
         definition = _definition_of(item) or _quality_hint(hinted_quality) or ("idx%d" % index)
-        # 同一清晰度出现多条（bvc2 + hvc1 ABR 变体）时，优先留下壳能解的那条，
-        # 否则先到的 bvc2 会把可播的 hvc1 顶掉，表现为只有声音没有画面
-        if definition not in rows or (
-            _hg_entry_is_bytevc2(rows[definition]) and not _hg_entry_is_bytevc2(item)
-        ):
+        if definition not in rows:
             rows[definition] = item
     if not rows:
         raise HongguoPluginError("播放模型没有清晰度")
@@ -6796,6 +4734,14 @@ def _decrypt_spade_url(value: str, key_seed: bytes) -> str:
             plaintext = plaintext[:-padding]
     return plaintext.rstrip(b"\0").decode("utf-8", errors="replace")
 
+def _parse_ref(value: str, prefix: str) -> str:
+    if not value.startswith(prefix):
+        raise HongguoPluginError("播放引用无效")
+    raw = value[len(prefix) :]
+    if not raw or not _VIDEO_ID.fullmatch(raw):
+        raise HongguoPluginError("播放引用格式无效")
+    return raw
+
 def _key_seed_from_model(model: Mapping[str, Any]) -> bytes:
     value = _text(model.get("key_seed"))
     if value:
@@ -6809,41 +4755,30 @@ def _key_seed_from_model(model: Mapping[str, Any]) -> bytes:
     return b""
 def _page(url):
     last_err = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
-            # 复用线程本地 session（keep-alive），省掉每次新建连接 + TLS 握手的开销
-            r = _hg_session().get(
+            r = requests.get(
                 url,
                 headers={
+                    "User-Agent": UA,
+                    "Accept-Language": "zh-CN,zh;q=0.9",
                     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
                     "Cache-Control": "no-cache",
                 },
-                timeout=8,
+                timeout=30,
             )
-            if r.status_code != 200:
-                raise HongguoPluginError(
-                    "页面 HTTP %d" % r.status_code,
-                    code=("HG_E_HTTP_4XX" if r.status_code < 500 else "HG_E_HTTP_5XX"),
-                )
+            r.raise_for_status()
             r.encoding = r.encoding or "utf-8"
             if not r.text or "_ROUTER_DATA" not in r.text:
-                raise HongguoPluginError(
-                    "页面没有路由数据（%d 字节）" % len(r.text or ""),
-                    code="HG_E_NON_JSON",
-                )
+                raise RuntimeError("empty or invalid page")
             return r.text
         except Exception as err:
             last_err = err
-            _hg_diag("page", "miss", n=attempt + 1, url=_hg_clean(url, 120),
-                     code=_hg_err_code(err), detail=err)
-            if attempt == 0:
-                try:
-                    time.sleep(0.3)
-                except Exception:
-                    pass
-    if isinstance(last_err, HongguoPluginError):
-        raise last_err
-    raise HongguoPluginError("page fetch failed: %s" % last_err, code=_hg_err_code(last_err))
+            try:
+                time.sleep(0.6 * (attempt + 1))
+            except Exception:
+                pass
+    raise RuntimeError("page fetch failed: %s" % last_err)
 
 def _data(url):
     html = _page(url)
@@ -6873,1175 +4808,59 @@ def _item(x):
         or "未命名"
     )
     count = vd.get("episode_cnt") or x.get("episode_cnt") or 0
-    try:
-        if str(sid).isdigit() and count:
-            _HG_STAMP[str(sid)] = int(count)
-    except Exception:
-        pass
     pic = str(vd.get("series_cover") or x.get("series_cover") or "")
     intro = str(vd.get("series_intro") or x.get("series_intro") or "")
+    remarks = ("全%s集" % count) if count else ""
+    if not remarks:
+        # 首页横幅没有集数，用第一个标签（如“都市爱情”）当备注，避免空白
+        tags = vd.get("tags") or x.get("tags") or []
+        if isinstance(tags, list) and tags:
+            remarks = str(tags[0])
     return {
         "vod_id": sid,
         "vod_name": name,
         "vod_pic": pic,
-        "vod_remarks": ("全%s集" % count) if count else "",
+        "vod_remarks": remarks,
         "vod_content": intro,
     }
 
 def _cat_item(x):
     return _item(x)
 
-# ===================== 分季 + 首页板块（本次改动） =====================
-_HG_TAB_MAP = {
-    "all": ("real-drama", u"热播短剧"),
-    "human": ("real-drama", u"热播真人剧"),
-    "comic": ("comic-drama", u"热播漫剧"),
-}
-_HG_SEASON_CACHE = {}
-_HG_TRIM_SIDS = set()
-# 列表页顺手记下的「官方当前集数」：分类/榜单/搜索的卡片都带 episode_cnt，
-# 拿它当版本戳，官方加了集数，下次进详情就能立刻发现缓存过期（零额外请求）。
-_HG_STAMP = {}
+def _filter_group(key, name, values):
+    return {"key": key, "name": name, "value": [{"n": n, "v": v} for n, v in values]}
 
-# ===================== 自动刷新（打开即刷新 + 后台轮询） =====================
-_HG_SWR_AFTER = max(60.0, float(os.environ.get("HG_SWR_MIN", "30") or 30) * 60)
-_HG_POLL_EVERY = max(300.0, float(os.environ.get("HG_POLL_MIN", "120") or 120) * 60)
-_HG_POLL_MAX = 3
-_HG_REFRESH_LOCK = threading.Lock()
-_HG_REFRESHING = set()
-_HG_POLL_STARTED = [False]
 
-
-def _hg_refresh_one(sid):
-    """重拉一部剧的详情 + 分季并写回缓存。「打开即刷新」和后台轮询共用。"""
-    sid = str(sid or u"")
-    if not sid.isdigit():
-        return False
-    with _HG_REFRESH_LOCK:
-        if sid in _HG_REFRESHING:
-            return False
-        _HG_REFRESHING.add(sid)
-    try:
-        try:
-            _HG_SEASON_CACHE.pop("sd:" + sid, None)
-            _HG_SEASON_CACHE.pop("season:" + sid, None)
-        except Exception:
-            pass
-        sd = _hg_sd(sid)
-        if not sd:
-            _hg_diag("refresh", "fail", sid=sid, why="详情拉取失败")
-            return False
-        seasons = _hg_seasons(sid, sd)
-        _all = _hg_disk_load()
-        _pl = {"v": 4, "ts": time.time(),
-               "trim": 1 if sid in _HG_TRIM_SIDS else 0,
-               "cnt": int(sd.get("episode_cnt") or 0),
-               "self": _hg_slim(sd),
-               "seasons": [{"no": no, "sd": _hg_slim(d)} for no, d in seasons]}
-        _all[sid] = _pl
-        for _no, _d in seasons:
-            _xid = str(_d.get("series_id") or u"")
-            if _xid and _xid != sid:
-                _all[_xid] = _pl
-        _hg_disk_save(_all)
-        _hg_diag("refresh", "ok", sid=sid, cnt=_pl["cnt"], seasons=len(seasons))
-        return True
-    except Exception as exc:
-        _hg_diag("refresh", "fail", sid=sid, err=type(exc).__name__)
-        return False
-    finally:
-        with _HG_REFRESH_LOCK:
-            _HG_REFRESHING.discard(sid)
-
-
-def _hg_refresh_async(sid):
-    """后台刷新：不阻塞当前这次打开。"""
-    def _run():
-        try:
-            _hg_refresh_one(sid)
-        except Exception:
-            pass
-    try:
-        t = threading.Thread(target=_run, name="hg-refresh")
-        t.daemon = True
-        t.start()
-    except Exception:
-        pass
-
-
-def _hg_poll_once():
-    """轮询一轮：把缓存里超过轮询间隔的剧各刷一遍（每次最多 3 部）。"""
-    due = []
-    for sid, pl in list(_hg_disk_load().items()):
-        if not isinstance(pl, dict):
-            continue
-        ts = float(pl.get("ts") or 0)
-        if ts and time.time() - ts > _HG_POLL_EVERY:
-            due.append((ts, sid))
-    due.sort()
-    done = 0
-    for _ts, sid in due[:_HG_POLL_MAX]:
-        if _hg_refresh_one(sid):
-            done += 1
-    if due:
-        _hg_diag("poll", "round", due=len(due), done=done)
-    return done
-
-
-def _hg_poll_start():
-    """后台轮询线程：只在本进程里起一次；HG_POLL=0 关掉。"""
-    if str(os.environ.get("HG_POLL", "") or "").strip() in ("0", "false", "no", "off"):
-        return
-    with _HG_REFRESH_LOCK:
-        if _HG_POLL_STARTED[0]:
-            return
-        _HG_POLL_STARTED[0] = True
-
-    def _loop():
-        while True:
-            try:
-                time.sleep(_HG_POLL_EVERY)
-                _hg_poll_once()
-            except Exception:
-                time.sleep(600)
-
-    try:
-        t = threading.Thread(target=_loop, name="hg-poll")
-        t.daemon = True
-        t.start()
-        _hg_diag("poll", "start", every_min=int(_HG_POLL_EVERY / 60))
-    except Exception:
-        pass
-_HG_SEARCH_API = SITE + "/api/search/result/"
-_HG_SEASON_RE = re.compile(u"第\\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\\s*[季部]")
-# 标题结尾的裸数字也当季号（如「……我终于发达了7」），数字前不能紧跟数字，避免把年份 1980 当季号
-_HG_TAIL_RE = re.compile(u"(?:[\\s·\\-—_：:.、]+)?(?<![0-9])([0-9]{1,3}|[一二三四五六七八九十]{1,3})\\s*$")
-# 「反向拿捏2：和闺蜜穿七零带着婆婆一起离」这类：季号贴在主标题末尾、后面接冒号副标题。
-# 只看冒号前的主标题尾部，1~2 位阿拉伯数字或半/全角括号数字；数字前不能紧跟数字（防 1980、2024）
-_HG_MAIN_TAIL_RE = re.compile(u"(?:[\\s·\\-—_]*)(?:[（(]\\s*([0-9]{1,2})\\s*[)）]|(?<![0-9])([0-9]{1,2}))\\s*$")
-# 「…刚下刑场你让我去考试一季 / 二季」这种省略「第」的写法：数字+季 收尾。
-# 只在结尾认，且前面至少留 4 个字当基名，避免把「人间四季」这类片名当第 4 季
-_HG_TAIL_SEASON_RE = re.compile(u"(?<![0-9一二三四五六七八九十])([0-9]{1,3}|[一二三四五六七八九十]{1,3})\\s*季\\s*$")
-_HG_CN = u"零一二三四五六七八九十"
-
-
-def _hg_cn(n):
-    try:
-        n = int(n)
-    except Exception:
-        return str(n)
-    if n <= 10:
-        return _HG_CN[n]
-    if n < 20:
-        return u"十" + _HG_CN[n % 10]
-    if n < 100:
-        return _HG_CN[n // 10] + u"十" + (_HG_CN[n % 10] if n % 10 else u"")
-    return str(n)
-
-
-def _hg_num(t):
-    t = str(t or "")
-    if t.isdigit():
-        return int(t)
-    if t == u"十":
-        return 10
-    if t.startswith(u"十"):
-        return 10 + (_HG_CN.index(t[1]) if len(t) > 1 and t[1] in _HG_CN else 0)
-    if u"十" in t:
-        a, _, b = t.partition(u"十")
-        return _HG_CN.index(a) * 10 + (_HG_CN.index(b) if b and b in _HG_CN else 0)
-    return _HG_CN.index(t) if t in _HG_CN else 0
-
-
-def _hg_season_no(name):
-    m = _HG_SEASON_RE.search(name or "")
-    if m:
-        return _hg_num(m.group(1))
-    ts = _HG_TAIL_SEASON_RE.search(name or "")
-    if ts and len((name or u"").strip()) - len(ts.group(0)) >= 4:
-        n = _hg_num(ts.group(1))
-        return n if 0 < n <= 99 else 0
-    t = _HG_TAIL_RE.search(name or "")
-    if t:
-        n = _hg_num(t.group(1))
-        return n if 0 < n <= 99 else 0
-    # 冒号副标题写法：季号在主标题末尾（第一部没有数字，按第一季处理）
-    main, sub = _hg_split_title(name)
-    if sub:
-        mm = _HG_MAIN_TAIL_RE.search(main)
-        if mm:
-            n = int(mm.group(1) or mm.group(2) or 0)
-            return n if 0 < n <= 99 else 0
-    return 0
-
-
-def _hg_bare_style(name):
-    """True 表示这部剧的季号是裸数字写法（标题里没有「第N季/部」）。"""
-    return not _HG_SEASON_RE.search(name or u"")
-
-
-def _hg_split_title(name):
-    """按第一个冒号拆成（主标题, 副标题）；没有冒号时副标题为空串。"""
-    raw = (name or u"").strip()
-    for sep in (u"：", u":"):
-        i = raw.find(sep)
-        if 0 < i < len(raw) - 1:
-            return raw[:i].strip(), raw[i + 1:].strip()
-    return raw, u""
-
-
-def _hg_main_style(name):
-    """「主标题+季号：副标题」写法里剥掉季号的主标题；不适用时返回空串。
-
-    只认这种形状：没有「第N季/部」、整个标题末尾没有裸数字（那是「道印入体：…7」
-    的写法，季号挂在副标题后面）、冒号前的主标题 4~12 个字。这样普通带副标题的剧
-    不会被拉去多探两轮。
-    """
-    raw = (name or u"").strip()
-    main, sub = _hg_split_title(raw)
-    if not sub or not (4 <= len(main) <= 12):
-        return u""
-    if _HG_SEASON_RE.search(raw) or _HG_TAIL_RE.search(raw):
-        return u""
-    mn = _HG_MAIN_TAIL_RE.sub(u"", main).strip(u"：:·-—_ 　")
-    if mn == main and re.search(u"[0-9]", main[-2:]):
-        # 主标题自己就以数字结尾（重生1980、2024 这类），不是季号写法
-        return u""
-    return mn
-
-
-def _hg_probe_kws(base, n, name):
-    """缺失季的探测关键词。主标题带季号的写法要按原样拼，只搜基名搜不到。"""
-    if _HG_TAIL_SEASON_RE.search(name or u""):
-        # 「…考试一季」这类省略「第」的：兄弟季叫「…考试二季」，不是「…考试第2季」
-        return [base + _hg_cn(n) + u"季", base + u"第" + _hg_cn(n) + u"季"]
-    mn = _hg_main_style(name)
-    if mn:
-        main, sub = _hg_split_title(name)
-        if _HG_MAIN_TAIL_RE.search(main):
-            # 手上已是第 N 部（主标题自带数字）：另一部靠基名搜索就能带出来，不必再探
-            return []
-        return [mn + str(n) + u"：" + sub]
-    if _hg_bare_style(name):
-        # 两种命名站上都有：正文多写「第N季」，也有裸数字结尾的，各探一次（都受 9s 预算约束）
-        return [base + u"第%s季" % _hg_cn(n), base + str(n)]
-    return [base + u"第%s季" % _hg_cn(n)]
-
-
-def _hg_base_name(name):
-    raw = (name or u"").strip()
-    b = _HG_SEASON_RE.sub(u"", raw).strip(u"：:·-—_ 　")
-    if b == raw:
-        # 裸数字结尾：剥掉数字再当基名，基名不足 4 个字就不剥（防「重生1980」这类误伤）
-        b2 = _HG_TAIL_RE.sub(u"", raw).strip(u"：:·-—_ 　")
-        if len(b2) >= 4 and b2 != raw:
-            b = b2
-    if b == raw:
-        # 「…你让我去考试一季 / 二季」：省略「第」的季号写法
-        b3 = _HG_TAIL_SEASON_RE.sub(u"", raw).strip(u"：:·-—_ 　")
-        if len(b3) >= 4 and b3 != raw:
-            b = b3
-    if len(b) < 4:
-        return u""
-    return b
-
-
-def _hg_group_id(sd):
-    si = sd.get("season_info") if isinstance(sd, dict) else None
-    if isinstance(si, dict):
-        g = si.get("series_group_id")
-        if g:
-            return str(g)
-    return u""
-
-
-_HG_TLS = threading.local()
-
-
-def _hg_session():
-    """每线程复用一条 requests 会话：keep-alive + gzip，省握手开销。"""
-    ses = getattr(_HG_TLS, "ses", None)
-    if ses is None:
-        ses = requests.Session()
-        ses.trust_env = False
-        ses.headers.update({
-            "User-Agent": UA,
-            "Referer": SITE + "/",
-            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-        })
-        _HG_TLS.ses = ses
-    return ses
-
-
-def _hg_fetch_sd(sid, timeout=8):
-    """单次请求拉详情（不重试），失败返回 {}。"""
-    started = time.time()
-    try:
-        r = _hg_session().get(SITE + "/detail?series_id=" + quote(str(sid), safe=u""), timeout=timeout)
-        if r.status_code != 200:
-            _hg_fail("detail/http", HongguoPluginError(
-                "详情页 HTTP %d" % r.status_code,
-                code=("HG_E_HTTP_4XX" if r.status_code < 500 else "HG_E_HTTP_5XX")),
-                sid=sid, n=len(r.content or b""), ms=_hg_ms(started))
-            return {}
-        j = _router_data(r.text)
-        p = ((j.get(u"loaderData") or {}).get(u"detail_page") or {}) if isinstance(j, dict) else {}
-        data = p.get(u"seriesDetail") or {}
-        if not data:
-            _hg_fail("detail/empty", HongguoPluginError(
-                "详情页没有 seriesDetail", code="HG_E_MODEL_EMPTY"),
-                sid=sid, n=len(r.text or ""), ms=_hg_ms(started))
-        return data
-    except Exception as exc:
-        _hg_fail("detail/fetch", exc, sid=sid, ms=_hg_ms(started))
-        return {}
-
-
-# 分季详情缓存：**只放进程内**，按用户要求不在设备本地建 json 文件。
-# 原来这里落盘 hg_seasons_cache.json（6h/24h 跨进程缓存），现在改成内存表：
-# 进程存活期间详情/分季仍然零请求复用，进程重启后重新拉一次，不留任何本地文件。
-_HG_DISK_MEM: dict[str, Any] = {}
-
-
-def _hg_slim(sd):
-    """只留拼线路要用的字段，控制缓存文件体积。"""
-    if not isinstance(sd, dict):
-        return {}
-    cele = [str(c.get("nickname") or "") for c in (sd.get("celebrities") or []) if isinstance(c, dict)]
-    return {
-        "series_id": str(sd.get("series_id") or ""),
-        "series_name": str(sd.get("series_name") or ""),
-        "series_cover": str(sd.get("series_cover") or ""),
-        "series_intro": str(sd.get("series_intro") or ""),
-        "episode_right_text": str(sd.get("episode_right_text") or ""),
-        "episode_cnt": sd.get("episode_cnt") or 0,
-        "tags": sd.get("tags") if isinstance(sd.get("tags"), list) else [],
-        "celebrities": [{"nickname": n} for n in cele if n],
-        "vid_list": [str(x) for x in (sd.get("vid_list") or [])],
-        "season_info": sd.get("season_info") if isinstance(sd.get("season_info"), dict) else {},
-    }
-
-
-# ---- 本地缓存文件（默认开；HG_CACHE_FILE=0 回到纯内存） ----
-_HG_CACHE_FILE_ON = str(os.environ.get("HG_CACHE_FILE", "1") or "").strip().lower() not in (
-    "0", "false", "no", "off")
-try:
-    _HG_CACHE_MAX_BYTES = max(256, int(os.environ.get("HG_CACHE_MAX_KB", "4096") or 4096)) * 1024
-except (TypeError, ValueError):
-    _HG_CACHE_MAX_BYTES = 4 * 1024 * 1024
-_HG_CACHE_LOADED = [False]
-_HG_CACHE_LAST = [0.0]
-_HG_CACHE_N = [0]
-
-
-def _hg_store_path():
-    """分季缓存文件：和日志同目录，/sdcard/Download/hg_cache.json（不可写则由 _hg_diag_dir 兜底）。"""
-    try:
-        d = _hg_diag_dir()
-    except Exception:
-        d = ""
-    return os.path.join(d, "hg_cache.json") if d else ""
-
-
-def _hg_cache_read():
-    p = _hg_store_path()
-    if not p:
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        _hg_diag("cache", "load-fail", err=type(exc).__name__)
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    out = {}
-    now = time.time()
-    for k, v in data.items():
-        if not isinstance(v, dict) or v.get("v") != 4:
-            continue
-        ts = float(v.get("ts") or 0)
-        if not ts:
-            continue
-        # 用和 detailContent 同一套有效期判断，过期条目干脆不带进来
-        ttl = 600 if v.get("trim") else (12 * 3600 if len(v.get("seasons") or []) > 1 else 2 * 3600)
-        if now - ts < ttl:
-            out[str(k)] = v
-    return out
-
-
-def _hg_cache_write(mem, force=False):
-    """原子写：先写 .tmp 再 replace，写一半断电也不会留坏文件。"""
-    if not _HG_CACHE_FILE_ON:
-        return
-    p = _hg_store_path()
-    if not p:
-        return
-    now = time.time()
-    grew = len(mem) > _HG_CACHE_N[0]
-    if not force and not grew and now - _HG_CACHE_LAST[0] < 120:
-        return
-    try:
-        items = sorted(mem.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)
-        blob = json.dumps(dict(items), ensure_ascii=False, separators=(",", ":"))
-        if len(blob.encode("utf-8")) > _HG_CACHE_MAX_BYTES:
-            # 超限：按时间从旧到新砍掉四分之一再序列化一次
-            keep = dict(items[:max(1, int(len(items) * 0.75))])
-            blob = json.dumps(keep, ensure_ascii=False, separators=(",", ":"))
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(blob)
-        os.replace(tmp, p)
-        _HG_CACHE_LAST[0] = now
-        _HG_CACHE_N[0] = len(mem)
-        _hg_diag("cache", "save", n=len(mem), kb=int(len(blob.encode("utf-8")) / 1024) + 1)
-    except Exception as exc:
-        _hg_diag("cache", "save-fail", err=type(exc).__name__, path=p)
-
-
-def _hg_disk_load():
-    """分季缓存：进程内为主；首次调用时从本地 hg_cache.json 捞回上次的内容。"""
-    try:
-        if not _HG_CACHE_LOADED[0]:
-            _HG_CACHE_LOADED[0] = True
-            if _HG_CACHE_FILE_ON:
-                try:
-                    disk = _hg_cache_read()
-                except Exception:
-                    disk = {}
-                if disk:
-                    for k, v in disk.items():
-                        _HG_DISK_MEM.setdefault(k, v)
-                    _HG_CACHE_N[0] = len(_HG_DISK_MEM)
-                    _hg_diag("cache", "load", n=len(disk), path=_hg_store_path())
-        return _HG_DISK_MEM
-    except Exception:
-        return {}
-
-
-def _hg_disk_save(all_data):
-    """写进程内缓存，并按需落盘（默认开，HG_CACHE_FILE=0 关闭）。"""
-    try:
-        items = sorted(all_data.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:120]
-        new = dict(items)
-    except Exception:
-        return
-    _HG_DISK_MEM.clear()
-    _HG_DISK_MEM.update(new)
-    try:
-        _hg_cache_write(_HG_DISK_MEM)
-    except Exception:
-        pass
-
-
-def _hg_sd(sid):
-    """单部详情：进程缓存 300s（失败 60s）→ 网络单次请求。"""
-    key = u"sd:" + str(sid)
-    hit = _HG_SEASON_CACHE.get(key)
-    if hit and time.time() - hit[0] < 300:
-        return hit[1]
-    sd = _hg_fetch_sd(sid)
-    if not sd:
-        sd = {}
-        _HG_SEASON_CACHE[key] = (time.time() - 240, sd)   # 失败短缓存 60 秒
-        _trim_store(_HG_SEASON_CACHE, cap=256)
-        return sd
-    _HG_SEASON_CACHE[key] = (time.time(), sd)
-    _trim_store(_HG_SEASON_CACHE, cap=256)
-    return sd
-
-
-def _hg_candidates(kw, pages=2, deadline=None):
-    """站内搜索取候选 (sid, name)，只认 query 参数，看 hasMore 翻页。"""
-    out = []
-    seen = set()
-
-    def _page(pg):
-        try:
-            return _search_api(kw, pg) or {}
-        except Exception:
-            return {}
-
-    # 多页时两页一起发（基名搜索固定翻 2 页，串行等于白等一个往返）
-    if pages > 1 and (deadline is None or time.time() <= deadline):
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, pages)) as _ex:
-                _pgs = list(_ex.map(_page, range(1, pages + 1)))
-        except Exception:
-            _pgs = [_page(1)]
-    else:
-        _pgs = [_page(1)]
-    for d in _pgs:
-        rows = d.get(u"searchList") or []
-        for it in rows:
-            vd = it.get(u"video_data") if isinstance(it.get(u"video_data"), dict) else it
-            sid = str(vd.get(u"series_id") or it.get(u"series_id") or u"")
-            if not sid.isdigit() or sid in seen:
-                continue
-            seen.add(sid)
-            out.append((sid, str(it.get(u"name") or vd.get(u"series_title") or u"")))
-            if len(out) >= 40:
-                return out
-        if not d.get(u"hasMore"):
-            break
-    return out
-
-
-def _hg_probe_first(kws, n=None):
-    """按顺序试探测关键词，命中即停。
-
-    「第N季」和「N季」两种写法各发一次搜索时，实测两边返回的是同一批剧，
-    一半请求是重复的；这里改成：谁先返回「带这一季号码的条目」就停。
-    但如果所有写法都只有别的季号（比如真身叫「…2」而先试的「…二季」只回了诱饵），
-    就继续试下一种写法，避免为了省请求把真季漏掉。
-    """
-    first = []
-    for kw in kws or []:
-        try:
-            rows = _hg_candidates(kw, 1, time.time() + 3)
-        except Exception:
-            rows = []
-        if rows and not first:
-            first = rows
-        if not rows or n is None:
-            continue
-        for _sid, nm in rows:
-            if _hg_season_no(nm) == n:
-                return rows
-    return first
-
-
-
-
-_HG_PRE_LOCK = threading.Lock()
-_HG_PRE_RUNNING = [0]
-_HG_PRE_MAX = 3
-
-
-def _hg_prefetch(sids, limit=3, seasons=True):
-    """后台预热：给刚出现的 series_id 预拉详情写缓存。绝不阻塞调用方，异常全吞。
-
-    seasons=False 时只热详情（进程内 300 秒），不跑分季合并。分类/榜单翻一页
-    就有 20 条，如果每条都跑「详情 + 基名搜索 2 页 + 补探 + 兄弟季详情」，
-    等于后台同时点开好几部剧，翻三五页就是几十个请求。
-    """
-    if not sids:
-        return
-    todo = [str(x) for x in sids if str(x).isdigit()][:limit]
-    if not todo:
-        return
-    try:
-        disk = _hg_disk_load()
-    except Exception:
-        disk = {}
-
-    def _run():
-        for sid in todo:
-            with _HG_PRE_LOCK:
-                if _HG_PRE_RUNNING[0] >= _HG_PRE_MAX:
-                    return
-                _HG_PRE_RUNNING[0] += 1
-            try:
-                c = disk.get(sid)
-                if isinstance(c, dict):
-                    continue
-                if not seasons:
-                    # 只热详情：不写分季 payload，避免把「只有一季」锁进缓存
-                    _hg_sd(sid)
-                    continue
-                sd = _hg_sd(sid)
-                if not sd:
-                    continue
-                _ses = _hg_seasons(sid, sd)
-                _all = _hg_disk_load()
-                # 这里必须和 detailContent 读缓存的版本号一致（都认 v4），
-                # 之前写 v3，于是首页/榜单的后台预取全部被判过期，白跑一遍。
-                _pl = {"v": 4, "ts": time.time(),
-                       "cnt": int(sd.get("episode_cnt") or 0), "self": _hg_slim(sd),
-                       "seasons": [{"no": no, "sd": _hg_slim(d)} for no, d in _ses]}
-                _all[sid] = _pl
-                for _no, _d in _ses:
-                    _xid = str(_d.get("series_id") or u"")
-                    if _xid and _xid != sid:
-                        _all[_xid] = _pl
-                _hg_disk_save(_all)
-            except Exception:
-                pass
-            finally:
-                with _HG_PRE_LOCK:
-                    _HG_PRE_RUNNING[0] -= 1
-
-    try:
-        t = threading.Thread(target=_run, name="hg-prefetch")
-        t.daemon = True
-        t.start()
-    except Exception:
-        pass
-
-
-_HG_OVR_CACHE = {"ts": 0.0, "data": {}}
-
-
-def _hg_season_override():
-    """手工分季表 hg_seasons.json：站点没把几季挂在同一组时，用它强行合并。
-
-    文件放在日志同目录或 /sdcard/Download，格式：
-        {"重生70猎户带妻女吃香喝辣": ["7691625956405939262", "7676505795629943832"]}
-    键可以是剧名、去掉季号后的基名，或当前 series_id；值是同属一部剧的 series_id 列表。
-    60 秒内只读一次盘；文件不存在或写错就当没有，不影响正常合并。
-    """
-    now = time.time()
-    if now - _HG_OVR_CACHE["ts"] < 60:
-        return _HG_OVR_CACHE["data"]
-    data = {}
-    dirs = []
-    try:
-        d = _hg_diag_dir()
-        if d:
-            dirs.append(d)
-    except Exception:
-        pass
-    dirs.append("/sdcard/Download")
-    for root in dirs:
-        path = os.path.join(root, "hg_seasons.json")
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-        except Exception:
-            continue
-        if isinstance(raw, dict):
-            data = raw
-            break
-    _HG_OVR_CACHE["ts"] = now
-    _HG_OVR_CACHE["data"] = data
-    return data
-
-
-def _hg_seasons(sid, sd, budget=9.0):
-    """真分季：基名搜索一页 + 缺失季定向探测；探测与拉详情同池并发，命中即收敛。
-
-    预算分两级：已经拿到 2 季以上就按软预算（5 秒）收工——够用了，别让壳里干等；
-    还只有单季说明线索没找齐，才继续用硬预算（9 秒）。被截断的结果只缓存 2 分钟，
-    下次进来会用完整体预算再跑一遍补全，不会把「少一季」锁住。
-    """
-    ck = u"season:" + str(sid)
-    hit = _HG_SEASON_CACHE.get(ck)
-    if hit and time.time() - hit[0] < 900:
-        return hit[1]
-    # 2026-11-24 移植官方取季（合并季数以官方为准）：plan/v + cell/change 精确拿到
-    # 这部剧的全部季（季号/series_id/集数），比基名搜索猜季可靠——不再漏季、
-    # 也不会把「…夺宝篇」这类番外错并进来。官方没给或详情补不齐时回退原有探测。
-    try:
-        _off = _hg_official_seasons_merged(sid, budget)
-    except Exception as _exc:
-        _hg_diag("season", "official-miss", sid=sid, code=_hg_err_code(_exc))
-        _off = []
-    if _off:
-        return _off
-    gid = _hg_group_id(sd)
-    base = _hg_base_name(sd.get("series_name") or u"")
-    if not base:
-        return [(0, sd)]
-    _t_start = time.time()
-    t_end = _t_start + budget
-    _nm0 = sd.get("series_name") or u""
-    _bare = _hg_bare_style(_nm0)
-    # 「反向拿捏2：副标题」这类写法的主标题；非空才值得多探一轮
-    _main_ref = _hg_main_style(_nm0)
-    _hg_diag("season", "start", sid=sid, name=_hg_clean(_nm0, 30), gid=gid or "-",
-             base=_hg_clean(base, 30), sno=_hg_season_no(_nm0))
-    if not gid:
-        if _hg_season_no(_nm0) < 1 and not _main_ref:
-            # 没有组号、标题里也没有季号线索：只靠搜索猜「哪几部是同一部剧」
-            # 会把「…夺宝篇」「…封神」这类番外并进来，所以保持单线路。
-            # 真要合并，写 hg_seasons.json 显式指定 series_id。
-            _hg_diag("season", "single", sid=sid, gid="-", base=_hg_clean(base, 30),
-                     found=0, ms=0, why="没有组号且标题无季号（可用 hg_seasons.json 指定）")
-            return [(0, sd)]
-        # 标题写了「第一季」却没有组号：只给一小段预算去找第二季，别让打开详情变慢
-        budget = min(budget, 4.5)
-        t_end = min(t_end, _t_start + budget)
-
-    def _same_group(d):
-        """同一部剧的判据：两边都有组号就认组号；一边缺组号时退到「基名一致 + 明确季号」。
-
-        站点只有部分条目带 season_info（series_group_id），另一半没有。旧逻辑
-        只要当前这部缺组号就直接放弃合并，于是「第二季/第三季」永远进不了播放线路。
-        """
-        if not isinstance(d, Mapping):
-            return False
-        if str(d.get("series_id") or u"") == str(sid):
-            return True
-        g = _hg_group_id(d)
-        if gid and g:
-            return g == gid
-        b = _hg_base_name(d.get("series_name") or u"")
-        if not b or not base or b != base:
-            return False
-        if gid or g:
-            # 一边有组号、一边没有：同基名就认，否则「缺组号的那一季」永远合不进来
-            return True
-        # 两边都没有组号：只认标题里明确写了 第N季/第N部 的，避免把「…夺宝篇」这类番外并进来
-        return _hg_season_no(d.get("series_name") or u"") >= 1
-
-    known = {(_hg_season_no(_nm0) or 1): str(sid)}
-    extra = []
-    try:
-        _cand = _hg_candidates(base, 2, time.time() + min(4.5, budget))
-        _hg_diag("season", "search", sid=sid, base=_hg_clean(base, 30), gid=gid or "-",
-                 n=len(_cand))
-        for csid, nm in _cand:
-            # 基名不同的（「…罪名不朽」「…考试啊」这类同前缀的别的剧）不占季号名额，
-            # 只留一条当备选。否则搜索里每冒出一部，就要多拉一次详情，
-            # 拉回来又被组号否掉、季号被释放、再补探，来回烧请求。
-            if _hg_base_name(nm) != base:
-                extra.append(csid)
-                continue
-            n = _hg_season_no(nm)
-            # 同一主标题、没有季号的那一部就是第一部
-            if not n and _main_ref and _hg_main_style(nm) == _main_ref:
-                n = 1
-            if n and n not in known:
-                known[n] = csid
-            elif not n:
-                extra.append(csid)
-    except Exception:
-        pass
-    found = {str(sid): sd}
-    pending = {}
-    probed = set()
-    _soft_end = _t_start + min(5.0, budget)
-    _trimmed = [False]
-
-    def _expired():
-        """到点没有：已有多季走软预算，只有单季走硬预算。"""
-        now = time.time()
-        if len(found) >= 2:
-            if now >= _soft_end:
-                _trimmed[0] = True
-                return True
-            return False
-        return now >= t_end
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-        for cid in list(known.values()) + extra[:1]:
-            if cid != str(sid) and cid not in found and cid not in pending:
-                pending[ex.submit(_hg_sd, cid)] = (u"detail", cid)
-        while pending and not _expired():
-            done = None
-            try:
-                done, _ = concurrent.futures.wait(list(pending), timeout=0.1,
-                                                  return_when=concurrent.futures.FIRST_COMPLETED)
-            except Exception:
-                break
-            for f in done:
-                kind, key = pending.pop(f)
-                try:
-                    val = f.result(timeout=0.1)
-                except Exception:
-                    val = None
-                if kind == u"detail":
-                    if val:
-                        found[key] = val
-                        # 同名诱饵（标题像第 N 季但其实是别的剧）抓进来了：
-                        # 释放这一季的名额，让下面的缺口探测重新去找真身
-                        if str(key) != str(sid) and not _same_group(val):
-                            for _k, _v in list(known.items()):
-                                if str(_v) == str(key):
-                                    known.pop(_k, None)
-                else:
-                    for csid, nm in (val or [])[:4]:
-                        if _hg_season_no(nm) == key and csid not in found and csid not in known.values():
-                            known[key] = csid
-                            pending[ex.submit(_hg_sd, csid)] = (u"detail", csid)
-                            break
-            # 缺失季：1..max+1 里没着落的，补探测（每轮最多 4 个）
-            # 已从搜索里认到季号、详情还在路上的，也算有着落，不再重复探同一季
-            _ver = set(x for x in known.keys() if x)
-            for _k, _d in found.items():
-                if _d and _same_group(_d):
-                    _ver.add(_hg_season_no(_d.get(u"series_name") or u""))
-            # 原逻辑只在「标题带季号 / 搜索已带回兄弟季」时才补探，于是
-            # 「组号在、但第二季没进搜索首页」的剧就只剩第一季。有组号时补探是安全的
-            # （下面用组号过滤诱饵），所以放宽；但为了不给单季剧拖时间，只补探 1 个。
-            _gate = (len(_ver) >= 2 or _hg_season_no(_nm0) > 0 or bool(_main_ref))
-            if (len(probed) < 9 and not _expired() and (_gate or bool(gid))):
-                mx = max(_ver) if _ver else 1
-                _nums = [x for x in range(1, mx + 2) if x not in _ver and x not in probed]
-                if _hg_season_no(_nm0) == 0:
-                    # 当前是「无季号」那条：先探第2季，别把唯一一次补探花在第1季上
-                    _nums.sort(key=lambda x: (x == 1, x))
-                for n in _nums[:(4 if _gate else 1)]:
-                    probed.add(n)
-                    pending[ex.submit(_hg_probe_first,
-                                      _hg_probe_kws(base, n, _nm0), n)] = (u"probe", n)
-    # 收尾补漏：诱饵被剔除后总会留下空洞，按缺的季号再定向探一次（最多 2 个）
-    _have = set()
-    for _x, _d in found.items():
-        if _d and _same_group(_d):
-            _have.add(_hg_season_no(_d.get(u"series_name") or u""))
-    _mx = max(_have) if _have else 1
-    _need = [x for x in range(1, _mx + 1) if x not in _have][:2]
-    # 收尾补漏是唯一的串行尾巴（每个 future 最多等 4~5 秒），这里一并封顶，
-    # 到点就带着已拿到的季返回，别把详情页拖到 8 秒以上。
-    if _need and not _expired():
-        # 两个缺号并发探，不再一个搜完再搜下一个
-        _cand = {}
-        try:
-            _kwjobs = [(_hg_probe_kws(base, _n, _nm0), _n) for _n in _need]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(_kwjobs))) as _ex:
-                _fs = {_ex.submit(_hg_probe_first, kws, _n): _n
-                       for kws, _n in _kwjobs}
-                for _f in list(_fs):
-                    try:
-                        _cand[_fs[_f]] = _f.result(timeout=2) or []
-                    except Exception:
-                        _cand[_fs[_f]] = []
-        except Exception:
-            _cand = {}
-        _jobs = []
-        for _n, _cl in _cand.items():
-            for _cid, _nm in (_cl or [])[:3]:
-                if _hg_season_no(_nm) == _n and _cid not in found:
-                    _jobs.append((_n, _cid))
-        if _jobs:
-            try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(_jobs))) as _ex:
-                    _fs2 = {_ex.submit(_hg_sd, _cid): _n for _n, _cid in _jobs}
-                    _got = set()
-                    for _f in list(_fs2):
-                        _n = _fs2[_f]
-                        if _n in _got:
-                            continue
-                        try:
-                            _d = _f.result(timeout=3)
-                        except Exception:
-                            continue
-                        if _d and _same_group(_d):
-                            found[str(_d.get("series_id") or "")] = _d
-                            _got.add(_n)
-            except Exception:
-                pass
-    # 手工分季表：显式指定的 series_id 一律并入（跳过组号/基名判断，但仍走去重）
-    _ovr_ids = set()
-    try:
-        for _k in (str(sid), base, _nm0):
-            _v = _hg_season_override().get(_k) if _k else None
-            if isinstance(_v, (list, tuple)):
-                _ovr_ids = set(str(x) for x in _v if str(x).strip().isdigit())
-                if _ovr_ids:
-                    break
-    except Exception:
-        _ovr_ids = set()
-    for _oid in list(_ovr_ids):
-        if _oid in found:
-            continue
-        _d = _hg_sd(_oid)
-        if _d and (_d.get("vid_list") or []):
-            found[_oid] = _d
-            _hg_diag("season", "override", sid=_oid,
-                     name=_hg_clean(_d.get("series_name") or u"", 30))
-    seasons = []
-    for x, d in found.items():
-        if not d:
-            continue
-        if x != str(sid) and x not in _ovr_ids and not _same_group(d):
-            continue
-        seasons.append((_hg_season_no(d.get(u"series_name") or u""), d))
-    # 防误判：分集内容与当前剧或已收季高度重叠的（同一部的重复条目）一律剔除
-    def _vset(d):
-        return set(str(v) for v in (d.get("vid_list") or []))
-    _self_v = _vset(sd)
-    _uniq = []
-    for no, d in seasons:
-        v = _vset(d)
-        if not v:
-            continue
-        _is_self = (d is sd) or (str(d.get("series_id") or u"") == str(sid))
-        dup = False
-        if not _is_self and _self_v:
-            small = min(len(v), len(_self_v))
-            if small and len(v & _self_v) >= max(1, int(small * 0.5)):
-                dup = True
-        if not dup:
-            for _n2, _d2 in _uniq:
-                v2 = _vset(_d2)
-                small = min(len(v), len(v2)) if v2 else 0
-                if small and len(v & v2) >= max(1, int(small * 0.5)):
-                    dup = True
-                    break
-        if not dup:
-            _uniq.append((no, d))
-    seasons = _uniq
-    if len(seasons) < 2:
-        # 凑不出第二部同组剧就保持单线路原样，绝不凭空造季
-        _hg_diag("season", "single", sid=sid, gid=gid or "-",
-                 base=_hg_clean(base, 30), found=len(found),
-                 why=("没有组号且搜索无意向兄弟季" if not gid else "组内只有这一季"),
-                 ms=_hg_ms(_t_start))
-        _HG_SEASON_CACHE[ck] = (time.time(), [(0, sd)])
-        _trim_store(_HG_SEASON_CACHE, cap=256)
-        return [(0, sd)]
-    if _trimmed[0]:
-        _hg_diag("season", "trim", sid=sid, got=len(seasons), ms=_hg_ms(_t_start),
-                 why="已够 2 季，软预算 5 秒收工（结果只缓存 2 分钟，下次补齐）")
-        try:
-            _HG_TRIM_SIDS.add(str(sid))
-        except Exception:
-            pass
-    else:
-        try:
-            _HG_TRIM_SIDS.discard(str(sid))
-        except Exception:
-            pass
-    _hg_diag("season", "merged", sid=sid, gid=gid or "-", n=len(seasons),
-             nos=[t[0] for t in seasons], ms=_hg_ms(_t_start),
-             trim=1 if _trimmed[0] else 0)
-    seasons.sort(key=lambda t: (t[0] if t[0] else 1))
-    if not any((d is sd) or (str(d.get("series_id") or "") == str(sid)) for _n, d in seasons):
-        seasons.insert(0, (0, sd))
-    # 被软预算截断的结果只留 2 分钟：读缓存的条件是「写入时间距今 < 900 秒」，
-    # 所以把 ts 往前挪，等价于缩短 TTL，不用改读取处。
-    _HG_SEASON_CACHE[ck] = (time.time() - (900 - 120) if _trimmed[0] else time.time(), seasons)
-    _trim_store(_HG_SEASON_CACHE, cap=256)
-    return seasons
-
-
-def _hg_cat_list(rows):
-    out = []
-    try:
-        for x in rows:
-            out.append(_cat_item(x))
-    except Exception:
-        pass
-    try:
-        # 列表页只热 2 条详情，分季留到真正点进去时算（原来是 6 条全跑分季）
-        _hg_prefetch([x.get("vod_id") for x in out], 2, seasons=False)
-    except Exception:
-        pass
-    return out
-
-
-# ===================== 官方排行榜（/rank/<key>） =====================
-# 官网排行榜共 8 个榜单：全站/真人剧/AI 剧 各分热播与新剧，另有口碑榜、追剧榜。
-# 每页 20 条、共 5 页，rank 字段是全站名次（第 2 页从 21 开始）。
-_HG_RANK_TABS = [
-    ("hot-drama", u"热播榜"),
-    ("new-drama", u"新剧榜"),
-    ("hot-real-drama", u"真人剧热播"),
-    ("new-real-drama", u"真人剧新剧"),
-    ("hot-ai-drama", u"AI剧热播"),
-    ("new-ai-drama", u"AI剧新剧"),
-    ("prestige-drama", u"口碑榜"),
-    ("followed-drama", u"追剧榜"),
-]
-_HG_RANK_KEYS = set(k for k, _ in _HG_RANK_TABS)
-
-
-_HG_RANK_CACHE = {}
-
-
-def _hg_rank_page(key, page=1):
-    """取官方排行榜页：/rank/<key>?page=N，数据在 _ROUTER_DATA 的 rankList。"""
-    k = key if key in _HG_RANK_KEYS else "hot-drama"
-    try:
-        page = max(1, int(page or 1))
-    except (TypeError, ValueError):
-        page = 1
-    _ck = (k, page)
-    _hit = _HG_RANK_CACHE.get(_ck)
-    if _hit and time.time() - _hit[0] < 600:
-        _hg_diag("rank", "cached", key=k, page=page, n=len(_hit[1][0] or []))
-        return _hit[1][0], _hit[1][1], page
-    url = SITE + "/rank/" + k
-    if page > 1:
-        url += "?page=%d" % page
-    j = _data(url)
-    for _k, v in ((j.get(u"loaderData") or {}) or {}).items():
-        if isinstance(v, dict) and isinstance(v.get("content"), dict):
-            c = v["content"]
-            if isinstance(c.get("rankList"), list):
-                rows = c.get("rankList") or []
-                pag = c.get("pagination") or {}
-                try:
-                    _HG_RANK_CACHE[_ck] = (time.time(), (rows, pag))
-                    _trim_store(_HG_RANK_CACHE, cap=64)
-                except Exception:
-                    pass
-                _hg_diag("rank", "ok", key=k, page=page, n=len(rows))
-                return rows, pag, page
-    _hg_diag("rank", "empty", key=k, page=page)
-    return [], {}, page
-
-
-def _hg_rank_list(rows):
-    """rankList → TVBox 卡片：备注放「第N名 · 热度 · 评分 · 标签」。"""
-    out = []
-    for x in rows or []:
-        if not isinstance(x, dict):
-            continue
-        sid = str(x.get("seriesId") or x.get("id") or u"")
-        name = str(x.get("title") or u"").strip()
-        if not sid.isdigit() or not name:
-            continue
-        try:
-            _cnt = int(x.get("episodeCount") or x.get("openEpisodeCount") or 0)
-            if _cnt:
-                _HG_STAMP[sid] = _cnt
-        except Exception:
-            pass
-        bits = []
-        rk = x.get("rank")
-        if isinstance(rk, int) and rk > 0:
-            bits.append(u"第%d名" % rk)
-        heat = str(x.get("heatText") or x.get("primaryMetricText") or u"").strip()
-        if heat:
-            bits.append(heat)
-        score = str(x.get("scoreText") or u"").strip()
-        if score:
-            bits.append(score)
-        it = {
-            "vod_id": "hg-series-v1:" + sid,
-            "vod_name": name,
-            "vod_pic": x.get("cover") or u"",
-            "vod_remarks": u" · ".join(bits),
-        }
-        desc = x.get("description")
-        if desc:
-            it["vod_content"] = str(desc)
-        tags = [str(t) for t in (x.get("tags") or []) if str(t).strip()][:2]
-        if tags:
-            it["vod_remarks"] = (it["vod_remarks"] + u" · " + u"、".join(tags)).strip(u" ·")
-        out.append(it)
-    return out
-
-
-def _hg_rank_content(tid, page, cat=""):
-    """排行榜/新剧两个入口共用：tid=rank 默认热播榜，tid=new 默认新剧榜。"""
-    key = str(cat or u"").strip()
-    if key not in _HG_RANK_KEYS:
-        key = "new-drama" if str(tid) == "new" else "hot-drama"
-    if str(tid) == "new" and not key.startswith("new-"):
-        key = "new-drama"
-    if str(tid) == "rank" and key.startswith("new-"):
-        key = "hot-drama"
-    try:
-        rows, pgn, pgno = _hg_rank_page(key, page)
-    except Exception as exc:
-        _hg_diag("rank", "fail", key=key, page=page, err=type(exc).__name__)
-        rows, pgn, pgno = [], {}, page
-    items = _hg_rank_list(rows)
-    pages = int((pgn or {}).get("totalPages") or 0) or 1
-    return {
-        "page": pgno,
-        "pagecount": pages,
-        "limit": len(items),
-        "total": pages * 20,
-        "list": items,
-    }
-
-
-def _hg_home_sections():
-    """按首页 homeSections 分板块出卡，标题取 tab_name，取不到给兜底名。"""
-    ck = u"home"
-    hit = _HG_SEASON_CACHE.get(ck)
-    if hit and time.time() - hit[0] < 900:
-        return hit[1]
-    out = []
-    seen = set()
-    try:
-        j = _data(SITE + u"/")
-        secs = (((j.get(u"loaderData") or {}).get(u"page") or {}).get(u"homeSections")) or []
-    except Exception:
-        secs = []
-    if isinstance(secs, list):
-        for sec in secs:
-            if not isinstance(sec, dict):
-                continue
-            tt = str(sec.get(u"tab_type") or u"")
-            tid, tname = _HG_TAB_MAP.get(tt, ("real-drama", u"红果热播"))
-            tn = str(sec.get(u"tab_name") or u"").strip()
-            if tn and tn.lower() not in (u"null", u"none", u"undefined"):
-                tname = tn
-            for x in (sec.get(u"video_list") or []):
-                it = _item(x)
-                vid = str(it.get("vod_id") or u"")
-                if not vid.isdigit() or vid in seen:
-                    continue
-                seen.add(vid)
-                it["type_id"] = tid
-                it["type_name"] = tname
-                out.append(it)
-    _HG_SEASON_CACHE[ck] = (time.time(), out)
-    _trim_store(_HG_SEASON_CACHE, cap=256)
-    return out
-
-
-
-_HG_SEARCH_PRIMED = [False]
-
-
-_HG_SEARCH_CACHE = {}
-
-
-def _search_api(key, page=1):
-    """搜索结果的 120 秒缓存：同一次打开里「基名」和「基名第N季」会被反复搜，
-    实测一部剧能打出 8~14 次搜索、其中一半是同关键词重复。"""
-    try:
-        ck = (str(key or u""), int(page or 1))
-    except (TypeError, ValueError):
-        ck = (str(key or u""), 1)
-    hit = _HG_SEARCH_CACHE.get(ck)
-    if hit and time.time() - hit[0] < 120:
-        _hg_diag("season", "search-cached", kw=_hg_clean(ck[0], 24), pg=ck[1])
-        return hit[1]
-    res = _search_api_raw(key, page)
-    try:
-        _HG_SEARCH_CACHE[ck] = (time.time(), res)
-        _trim_store(_HG_SEARCH_CACHE, cap=128)
-    except Exception:
-        pass
-    return res
-
-
-def _search_api_raw(key: str, page: int = 1) -> dict:
-    """官网搜索接口 /api/search/result（搜索页已改客户端渲染，SSR 无数据）。
-
-    原来每次搜索都先抓一遍 586KB 的首页拿 ttwid，一部十季剧要搜七八次，
-    白花七八个首页请求（实测每次 250~1200ms）。现在复用线程本地 session 直连搜索，
-    真的返回空列表时才补一次首页 cookie 重试，且每个进程只补一次。
-    """
+def _search_api(key: str, page: int = 1) -> dict:
+    """官网搜索接口 /api/search/result（搜索页已改客户端渲染，SSR 无数据）。"""
     empty = {"searchList": [], "totalCount": 0, "totalPages": 1, "hasMore": False}
-    params = {"aid": "8662", "query": str(key or ""), "page": str(max(1, int(page or 1)))}
-
-    def _once():
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update(
+            {
+                "User-Agent": UA,
+                "Accept": "application/json, text/plain, */*",
+                "Referer": SITE + "/",
+            }
+        )
+        # 首访拿 ttwid，缺了上游只回空列表
         try:
-            r = _hg_session().get(SITE + "/api/search/result", params=params, timeout=8,
-                                  headers={"Accept": "application/json, text/plain, */*"})
-            if r.status_code != 200:
-                return None
-            return r.json()
+            session.get(SITE + "/", timeout=10)
         except Exception:
-            return None
-
-    data = _once()
-    try:
-        if not (isinstance(data, dict) and data.get("searchList")) and not _HG_SEARCH_PRIMED[0]:
-            # 极少数情况下上游要 ttwid 才回数据：补一次首页再试（仅一次）
-            _HG_SEARCH_PRIMED[0] = True
-            try:
-                _hg_session().get(SITE + "/", timeout=8)
-            except Exception:
-                pass
-            data = _once()
-    except Exception:
-        data = data if isinstance(data, dict) else None
-    if not isinstance(data, dict):
-        return empty
-    try:
+            pass
+        r = session.get(
+            SITE + "/api/search/result",
+            params={
+                "aid": "8662",
+                "query": str(key or ""),
+                "page": str(max(1, int(page or 1))),
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return empty
+        data = r.json()
         rows = data.get("searchList") or []
         if not isinstance(rows, list) or not rows:
             return empty
@@ -8116,29 +4935,13 @@ def _search_by_keywords(keywords, page: int) -> dict:
     }
 
 
-_HG_SCAN_CACHE = {}
-
-
-def _hg_scan_remember(ck, res):
-    try:
-        _HG_SCAN_CACHE[ck] = (time.time(), res)
-        _trim_store(_HG_SCAN_CACHE, cap=64)
-    except Exception:
-        pass
-    return res
-
-
-def _hg_search_scan(key, page=1, max_pages=3):
+def _hg_search_scan(key, page=1, max_pages=8):
     """搜索兜底：官方搜索接口被风控时，扫官方分类页按标题命中（并发）。"""
     key = str(key or "").strip()
     page = max(1, int(page or 1))
     empty = {"page": page, "pagecount": 1, "limit": 0, "total": 0, "list": []}
     if not key:
         return empty
-    _ck = (key, page)
-    _hit = _HG_SCAN_CACHE.get(_ck)
-    if _hit and time.time() - _hit[0] < 300:
-        return _hit[1]
     routes = [r for r, _n, _c in _HG_CONTENT_TYPES]
     jobs = [(r, p) for r in routes for p in range(1, max_pages + 1)]
 
@@ -8169,18 +4972,41 @@ def _hg_search_scan(key, page=1, max_pages=3):
     except Exception:
         pass
     if not hits:
-        return _hg_scan_remember(_ck, empty)
+        return empty
     per = 20
     st = (page - 1) * per
     chunk = hits[st:st + per]
-    return _hg_scan_remember(_ck, {
+    return {
         "page": page,
         "pagecount": max(1, (len(hits) + per - 1) // per),
         "limit": len(chunk),
         "total": len(hits),
         "list": chunk,
-    })
+    }
 
+
+def _category_loader(page: int, q: dict) -> dict:
+    """分类页带重试；page=1 偶发空列表时多试几次。"""
+    page = max(1, int(page or 1))
+    q = dict(q or {})
+    if page > 1:
+        q["page"] = str(page)
+    last = {}
+    for attempt in range(3):
+        try:
+            data = _data(SITE + "/category?" + urlencode(q))
+            p = (data.get("loaderData") or {}).get("category_$") or (data.get("loaderData") or {}).get("category_page") or {}
+            rows = p.get("recommendList") or []
+            if rows or page > 1:
+                return p
+            last = p or last
+        except Exception:
+            pass
+        try:
+            time.sleep(0.5 * (attempt + 1))
+        except Exception:
+            pass
+    return last
 
 # =============================================================================
 # 弹幕子系统（红果 App 评论 / 弹幕接口）
@@ -8201,11 +5027,7 @@ _DM_ENABLED = True          # 总开关：关掉则 playerContent 不再挂弹�
 _DM_HOST = "api5-normal-lq.fqnovel.com"
 _DM_WINDOW_MS = 30000       # 每个取数窗口（毫秒）
 _DM_MAX_WINDOWS = 20        # 最多取 20 个窗口（约 10 分钟，覆盖短剧整集）
-_DM_TTL = 1800              # 弹幕缓存有效期（秒，只用于取到内容的成功结果）
-_DM_FAIL_TTL = 45          # 取失败的结果只压 45 秒，绝不把一次失败锁死半小时
-_DM_MIN_GAP = 0.28         # 两次弹幕请求之间的最小间隔（秒），削峰防接口限流
-_DM_PAGE_WORKERS = 2       # 每批并发的取数窗口数，降低瞬时并发
-_DM_RETRY_DELAY = 6.0      # 撞上限流后隔多久再补一次
+_DM_TTL = 1800              # 弹幕缓存有效期（秒）
 _DM_WAIT = 18               # 弹幕路由最多等取数完成多少秒
 _DM_IN_PLAYER = "list"      # playerContent 里 danmaku 字段形态: list / url / off
 _DM_PUSH_LOCAL = True       # 额外用壳的 127.0.0.1:9978/action 推一次（老壳兜底）
@@ -8213,10 +5035,7 @@ _DM_SID_MAP: dict[str, str] = {}
 _DM_CACHE: dict[str, dict[str, Any]] = {}
 _DM_EVENTS: dict[str, threading.Event] = {}
 _DM_LOCKS = threading.Lock()
-_DM_POST_LOCK = threading.Lock()
-_DM_POST_LAST = 0.0
-_DM_PUSHED: dict[str, float] = {}
-_DM_STREAM_HIT: dict[str, float] = {}
+_DM_PUSHED: set[str] = set()
 _DM_HIT: dict[str, float] = {}
 _DM_LAST_ERR = ""
 
@@ -8618,17 +5437,8 @@ def _dm_page(vid: str, series_id: str, start_ms: int, device_id: str,
     url = "https://%s/novel/commentapi/comment/list/%s/v1/?%s" % (_DM_HOST, vid, query)
     sess = requests.Session()
     sess.trust_env = False
-    global _DM_POST_LAST
-    with _DM_POST_LOCK:
-        _gap = _DM_MIN_GAP - (time.time() - _DM_POST_LAST)
-        if _gap > 0:
-            try:
-                time.sleep(_gap)
-            except Exception:
-                pass
-        _DM_POST_LAST = time.time()
     response = sess.post(url, data=body, headers=headers, timeout=20)
-    data = _json_response(response, stage="danmaku")
+    data = _json_response(response)
     if isinstance(data, Mapping) and data.get("code") not in (0, None):
         raise HongguoPluginError("弹幕接口 code=%s %s" % (data.get("code"), data.get("message") or ""))
     payload_data = (data or {}).get("data") if isinstance(data, Mapping) else None
@@ -8671,14 +5481,14 @@ def _dm_fetch(vid: str, series_id: str, device_id: str, install_id: str = "") ->
     empty_batches = 0
     stop = False
     try:
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=_DM_PAGE_WORKERS)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     except Exception:
         pool = None
     try:
-        for base in range(0, len(windows), _DM_PAGE_WORKERS):
+        for base in range(0, len(windows), 4):
             if stop:
                 break
-            batch = windows[base:base + _DM_PAGE_WORKERS]
+            batch = windows[base:base + 4]
             if pool is None:
                 results = []
                 for start in batch:
@@ -8754,20 +5564,15 @@ def _dm_state(vid: str) -> dict:
 
 def _dm_set_state(vid: str, items: list, error: str = "") -> None:
     with _DM_LOCKS:
-        _DM_CACHE[vid] = {"t": time.time(), "items": items, "error": error,
-                          "ttl": _DM_TTL if items else _DM_FAIL_TTL}
+        _DM_CACHE[vid] = {"t": time.time(), "items": items, "error": error}
         event = _DM_EVENTS.get(vid)
     if event is not None:
         event.set()
 
 
 def _dm_get(vid: str, series_id: str = "", device_id: str = "", install_id: str = "",
-            wait: float = 0, force: bool = False) -> dict:
-    """拿一集弹幕（带缓存 + 后台去重）。wait 秒内没取完就先返回当前状态。
-
-    force=True 时忽略缓存里「上次取失败」的结果，重新请求一次；
-    取到的内容仍然按 _DM_TTL 缓存，失败只按 _DM_FAIL_TTL 短存，避免一次限流就哑掉半小时。
-    """
+            wait: float = 0) -> dict:
+    """拿一集弹幕（带缓存 + 后台去重）。wait 秒内没取完就先返回当前状态。"""
     vid = str(vid or "")
     if not vid:
         return {"items": [], "error": "missing vid"}
@@ -8777,9 +5582,7 @@ def _dm_get(vid: str, series_id: str = "", device_id: str = "", install_id: str 
         return {"items": [], "error": "no sid"}
     with _DM_LOCKS:
         state = dict(_DM_CACHE.get(vid) or {})
-        _ttl = float(state.get("ttl") or _DM_TTL)
-        _fresh = state and (time.time() - float(state.get("t") or 0)) < _ttl
-        if _fresh and not (force and not (state.get("items") or [])):
+        if state and (time.time() - float(state.get("t") or 0)) < _DM_TTL:
             return state
         event = _DM_EVENTS.get(vid)
         need_spawn = event is None or event.is_set()
@@ -8793,15 +5596,6 @@ def _dm_get(vid: str, series_id: str = "", device_id: str = "", install_id: str 
                 items = _dm_fetch(vid, series_id, device_id, install_id)
                 if not items:
                     err = _DM_LAST_ERR or "empty"
-                    # 一次取空多半是撞了接口限流，歇一会儿补一次再下结论
-                    if "103001" in err or "参数错误" in err:
-                        try:
-                            time.sleep(_DM_RETRY_DELAY)
-                        except Exception:
-                            pass
-                        items = _dm_fetch(vid, series_id, device_id, install_id)
-                        if items:
-                            err = ""
             except Exception as exc:
                 items, err = [], str(exc)
             _dm_set_state(vid, items, err)
@@ -8824,14 +5618,41 @@ def _dm_series_of(vid: str) -> str:
     return str(_DM_SID_MAP.get(str(vid or "")) or "")
 
 
+_DM_SERIES_FILE = ""
+
+
+def _dm_series_path() -> str:
+    global _DM_SERIES_FILE
+    if not _DM_SERIES_FILE:
+        try:
+            _DM_SERIES_FILE = os.path.join(_hg_cache_dir(), "series_map.json")
+        except Exception:
+            _DM_SERIES_FILE = os.path.join(tempfile.gettempdir(), "hg_series_map.json")
+    return _DM_SERIES_FILE
+
+
 def _dm_series_load() -> None:
-    """弹幕 vid→剧集 映射只留在进程内存：按用户要求不读也不写本地 json 文件。"""
-    return
+    if _DM_SID_MAP:
+        return
+    try:
+        with open(_dm_series_path(), "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        if isinstance(data, dict):
+            for key, value in list(data.items())[:4000]:
+                if str(key).isdigit() and str(value).isdigit():
+                    _DM_SID_MAP[str(key)] = str(value)
+    except Exception:
+        pass
 
 
 def _dm_series_save() -> None:
-    """只保留进程内映射（_DM_SID_MAP）：按用户要求不落盘，不生成 series_map.json。"""
-    return
+    try:
+        path = _dm_series_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(_DM_SID_MAP, fp, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def _dm_xml_escape(text: str) -> str:
@@ -8859,41 +5680,445 @@ def _dm_to_json(items: list) -> bytes:
 
 
 def _dm_push_local(url: str, vid: str) -> None:
-    """老壳可能不读 playerContent.danmaku，用壳自己的本地接口补推一次。
-
-    短剧预载会在上一集还在播时先把下一集的 playerContent 要来（也会走到这里），
-    若当场就推，等于把下一集的弹幕源塞给正在播的这一集，切过去后壳反而不再来取。
-    所以推迟到「别的集已经几秒没有取流、这一集也没被播放器自己取过弹幕」时才推，
-    并且允许同一集隔一段时间重推（不再是一集一辈子一次）。
-    """
-    if not _DM_PUSH_LOCAL or not url or not vid:
+    """老壳可能不读 playerContent.danmaku，用壳自己的本地接口再推一次。"""
+    global _DM_PUSHED
+    if not _DM_PUSH_LOCAL or not url or vid in _DM_PUSHED:
         return
-    now = time.time()
-    if now - float(_DM_PUSHED.get(vid) or 0) < 240:
-        return
-    _DM_PUSHED[vid] = now
+    _DM_PUSHED.add(vid)
 
     def _run():
         try:
-            from urllib.parse import quote as _quote
-            for _i in range(8):
-                time.sleep(4.0)
-                if _DM_HIT.get(vid, 0) > time.time() - 30:
-                    return          # 播放器自己来取过了，不必推
-                _others = [t for k, t in list(_DM_STREAM_HIT.items()) if k != vid]
-                if _others and max(_others) > time.time() - 4.0:
-                    continue        # 还有别的集在取流，说明在预载/还没切过来
-                target = "http://127.0.0.1:9978/action?do=refresh&type=danmaku&path=" + _quote(url, safe="")
-                session = requests.Session()
-                session.trust_env = False
-                session.get(target, timeout=3)
+            time.sleep(2.5)
+            # 播放器已经自己来取过 /hg_dm 了，就不必再推一遍（免得弹幕闪一下）
+            if _DM_HIT.get(vid, 0) > time.time() - 30:
                 return
+            from urllib.parse import quote as _quote
+            target = "http://127.0.0.1:9978/action?do=refresh&type=danmaku&path=" + _quote(url, safe="")
+            session = requests.Session()
+            session.trust_env = False
+            session.get(target, timeout=3)
         except Exception:
             pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ---- 分季（自红果短剧版移植）：多季剧一季一条线路「第一季 超清」 ----
+_HG_SEASON_CACHE = {}
+_HG_SEASON_RE = re.compile(u"第\\s*([0-9]{1,3}|[一二三四五六七八九十]{1,3})\\s*[季部]")
+_HG_TAIL_RE = re.compile(u"(?:[\\s·\\-—_：:.、]+)?(?<![0-9])([0-9]{1,3}|[一二三四五六七八九十]{1,3})\\s*$")
+_HG_MAIN_TAIL_RE = re.compile(u"(?:[\\s·\\-—_]*)(?:[（(]\\s*([0-9]{1,2})\\s*[)）]|(?<![0-9])([0-9]{1,2}))\\s*$")
+_HG_CN = u"零一二三四五六七八九十"
+_HG_DISK_MEM: dict[str, Any] = {}
+
+
+def _hg_fetch_sd(sid, timeout=8):
+    """单次请求拉详情（不重试），失败返回 {}。用本文件的 _data 解析 _ROUTER_DATA。"""
     try:
-        threading.Thread(target=_run, daemon=True).start()
+        p = ((_data(SITE + "/detail?series_id=" + quote(str(sid), safe="")).get("loaderData") or {}).get("detail_page") or {})
+        return p.get("seriesDetail") or {}
+    except Exception:
+        return {}
+
+
+def _trim_store(store: Any, cap: int = 512, max_age: float = 0.0) -> None:
+    """给常驻进程用的字典裁剪：超量就丢最旧的（必要时先丢过期的）。
+
+    影视仓里的 py 进程可能连跑几周不重启，这类"记一下 vid/剧集"的表
+    如果没人裁剪，键值对会一直涨——属于典型的长稳隐患。
+    dict 保序，所以 next(iter(store)) 拿到的就是最早写入的那个。
+    """
+    try:
+        if not isinstance(store, dict):
+            return
+        if max_age > 0:
+            cutoff = time.time() - max_age
+            for key in [k for k, v in store.items() if isinstance(v, (int, float)) and v < cutoff]:
+                store.pop(key, None)
+        while len(store) > cap:
+            try:
+                store.pop(next(iter(store)))
+            except StopIteration:
+                break
     except Exception:
         pass
+
+
+def _hg_cn(n):
+    try:
+        n = int(n)
+    except Exception:
+        return str(n)
+    if n <= 10:
+        return _HG_CN[n]
+    if n < 20:
+        return u"十" + _HG_CN[n % 10]
+    if n < 100:
+        return _HG_CN[n // 10] + u"十" + (_HG_CN[n % 10] if n % 10 else u"")
+    return str(n)
+
+
+def _hg_num(t):
+    t = str(t or "")
+    if t.isdigit():
+        return int(t)
+    if t == u"十":
+        return 10
+    if t.startswith(u"十"):
+        return 10 + (_HG_CN.index(t[1]) if len(t) > 1 and t[1] in _HG_CN else 0)
+    if u"十" in t:
+        a, _, b = t.partition(u"十")
+        return _HG_CN.index(a) * 10 + (_HG_CN.index(b) if b and b in _HG_CN else 0)
+    return _HG_CN.index(t) if t in _HG_CN else 0
+
+
+def _hg_season_no(name):
+    m = _HG_SEASON_RE.search(name or "")
+    if m:
+        return _hg_num(m.group(1))
+    t = _HG_TAIL_RE.search(name or "")
+    if t:
+        n = _hg_num(t.group(1))
+        return n if 0 < n <= 99 else 0
+    # 冒号副标题写法：季号在主标题末尾（第一部没有数字，按第一季处理）
+    main, sub = _hg_split_title(name)
+    if sub:
+        mm = _HG_MAIN_TAIL_RE.search(main)
+        if mm:
+            n = int(mm.group(1) or mm.group(2) or 0)
+            return n if 0 < n <= 99 else 0
+    return 0
+
+
+def _hg_bare_style(name):
+    """True 表示这部剧的季号是裸数字写法（标题里没有「第N季/部」）。"""
+    return not _HG_SEASON_RE.search(name or u"")
+
+
+def _hg_split_title(name):
+    """按第一个冒号拆成（主标题, 副标题）；没有冒号时副标题为空串。"""
+    raw = (name or u"").strip()
+    for sep in (u"：", u":"):
+        i = raw.find(sep)
+        if 0 < i < len(raw) - 1:
+            return raw[:i].strip(), raw[i + 1:].strip()
+    return raw, u""
+
+
+def _hg_main_style(name):
+    """「主标题+季号：副标题」写法里剥掉季号的主标题；不适用时返回空串。
+
+    只认这种形状：没有「第N季/部」、整个标题末尾没有裸数字（那是「道印入体：…7」
+    的写法，季号挂在副标题后面）、冒号前的主标题 4~12 个字。这样普通带副标题的剧
+    不会被拉去多探两轮。
+    """
+    raw = (name or u"").strip()
+    main, sub = _hg_split_title(raw)
+    if not sub or not (4 <= len(main) <= 12):
+        return u""
+    if _HG_SEASON_RE.search(raw) or _HG_TAIL_RE.search(raw):
+        return u""
+    mn = _HG_MAIN_TAIL_RE.sub(u"", main).strip(u"：:·-—_ 　")
+    if mn == main and re.search(u"[0-9]", main[-2:]):
+        # 主标题自己就以数字结尾（重生1980、2024 这类），不是季号写法
+        return u""
+    return mn
+
+
+def _hg_probe_kws(base, n, name):
+    """缺失季的探测关键词。主标题带季号的写法要按原样拼，只搜基名搜不到。"""
+    mn = _hg_main_style(name)
+    if mn:
+        main, sub = _hg_split_title(name)
+        if _HG_MAIN_TAIL_RE.search(main):
+            # 手上已是第 N 部（主标题自带数字）：另一部靠基名搜索就能带出来，不必再探
+            return []
+        return [mn + str(n) + u"：" + sub]
+    if _hg_bare_style(name):
+        return [base + str(n)]
+    return [base + u"第%s季" % _hg_cn(n)]
+
+
+def _hg_base_name(name):
+    raw = (name or u"").strip()
+    b = _HG_SEASON_RE.sub(u"", raw).strip(u"：:·-—_ 　")
+    if b == raw:
+        # 裸数字结尾：剥掉数字再当基名，基名不足 4 个字就不剥（防「重生1980」这类误伤）
+        b2 = _HG_TAIL_RE.sub(u"", raw).strip(u"：:·-—_ 　")
+        if len(b2) >= 4 and b2 != raw:
+            b = b2
+    if len(b) < 4:
+        return u""
+    return b
+
+
+def _hg_group_id(sd):
+    si = sd.get("season_info") if isinstance(sd, dict) else None
+    if isinstance(si, dict):
+        g = si.get("series_group_id")
+        if g:
+            return str(g)
+    return u""
+
+
+_HG_TLS = threading.local()
+
+
+def _hg_slim(sd):
+    """只留拼线路要用的字段，控制缓存文件体积。"""
+    if not isinstance(sd, dict):
+        return {}
+    cele = [str(c.get("nickname") or "") for c in (sd.get("celebrities") or []) if isinstance(c, dict)]
+    return {
+        "series_id": str(sd.get("series_id") or ""),
+        "series_name": str(sd.get("series_name") or ""),
+        "series_cover": str(sd.get("series_cover") or ""),
+        "series_intro": str(sd.get("series_intro") or ""),
+        "episode_right_text": str(sd.get("episode_right_text") or ""),
+        "episode_cnt": sd.get("episode_cnt") or 0,
+        "tags": sd.get("tags") if isinstance(sd.get("tags"), list) else [],
+        "celebrities": [{"nickname": n} for n in cele if n],
+        "vid_list": [str(x) for x in (sd.get("vid_list") or [])],
+        "season_info": sd.get("season_info") if isinstance(sd.get("season_info"), dict) else {},
+    }
+
+
+def _hg_disk_load():
+    """取进程内分季缓存（不读本地文件）。"""
+    try:
+        return _HG_DISK_MEM
+    except Exception:
+        return {}
+
+
+def _hg_disk_save(all_data):
+    """只写进程内缓存：按用户要求不落盘，不生成 hg_seasons_cache.json。"""
+    try:
+        items = sorted(all_data.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:120]
+        new = dict(items)
+    except Exception:
+        return
+    _HG_DISK_MEM.clear()
+    _HG_DISK_MEM.update(new)
+
+
+def _hg_sd(sid):
+    """单部详情：进程缓存 300s → 磁盘缓存 6h → 网络单次请求。"""
+    key = u"sd:" + str(sid)
+    hit = _HG_SEASON_CACHE.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    sd = _hg_fetch_sd(sid)
+    if not sd:
+        sd = {}
+        _HG_SEASON_CACHE[key] = (time.time() - 240, sd)   # 失败短缓存 60 秒
+        _trim_store(_HG_SEASON_CACHE, cap=256)
+        return sd
+    _HG_SEASON_CACHE[key] = (time.time(), sd)
+    _trim_store(_HG_SEASON_CACHE, cap=256)
+    return sd
+
+
+def _hg_candidates(kw, pages=2, deadline=None):
+    """站内搜索取候选 (sid, name)，只认 query 参数，看 hasMore 翻页。"""
+    out = []
+    seen = set()
+    for pg in range(1, pages + 1):
+        if deadline is not None and time.time() > deadline:
+            break
+        try:
+            d = _search_api(kw, pg) or {}
+        except Exception:
+            break
+        rows = d.get(u"searchList") or []
+        for it in rows:
+            vd = it.get(u"video_data") if isinstance(it.get(u"video_data"), dict) else it
+            sid = str(vd.get(u"series_id") or it.get(u"series_id") or u"")
+            if not sid.isdigit() or sid in seen:
+                continue
+            seen.add(sid)
+            out.append((sid, str(it.get(u"name") or vd.get(u"series_title") or u"")))
+            if len(out) >= 40:
+                return out
+        if not d.get(u"hasMore"):
+            break
+    return out
+
+
+
+
+_HG_PRE_LOCK = threading.Lock()
+_HG_PRE_RUNNING = [0]
+_HG_PRE_MAX = 3
+
+
+def _hg_seasons(sid, sd, budget=9.0):
+    """真分季：基名搜索一页 + 缺失季定向探测；探测与拉详情同池并发，命中即收敛。"""
+    ck = u"season:" + str(sid)
+    hit = _HG_SEASON_CACHE.get(ck)
+    if hit and time.time() - hit[0] < 900:
+        return hit[1]
+    gid = _hg_group_id(sd)
+    if not gid:
+        return [(0, sd)]
+    base = _hg_base_name(sd.get("series_name") or u"")
+    if not base:
+        return [(0, sd)]
+    t_end = time.time() + budget
+    _nm0 = sd.get("series_name") or u""
+    _bare = _hg_bare_style(_nm0)
+    # 「反向拿捏2：副标题」这类写法的主标题；非空才值得多探一轮
+    _main_ref = _hg_main_style(_nm0)
+    known = {(_hg_season_no(_nm0) or 1): str(sid)}
+    extra = []
+    try:
+        for csid, nm in _hg_candidates(base, 1, time.time() + min(3.0, budget)):
+            n = _hg_season_no(nm)
+            # 同一主标题、没有季号的那一部就是第一部
+            if not n and _main_ref and _hg_main_style(nm) == _main_ref:
+                n = 1
+            if n and n not in known:
+                known[n] = csid
+            elif not n:
+                extra.append(csid)
+    except Exception:
+        pass
+    found = {str(sid): sd}
+    pending = {}
+    probed = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        for cid in list(known.values()) + extra[:1]:
+            if cid != str(sid) and cid not in found and cid not in pending:
+                pending[ex.submit(_hg_sd, cid)] = (u"detail", cid)
+        while pending and time.time() < t_end:
+            done = None
+            try:
+                done, _ = concurrent.futures.wait(list(pending), timeout=0.1,
+                                                  return_when=concurrent.futures.FIRST_COMPLETED)
+            except Exception:
+                break
+            for f in done:
+                kind, key = pending.pop(f)
+                try:
+                    val = f.result(timeout=0.1)
+                except Exception:
+                    val = None
+                if kind == u"detail":
+                    if val:
+                        found[key] = val
+                        # 同名诱饵（标题像第 N 季但其实是别的剧）抓进来了：
+                        # 释放这一季的名额，让下面的缺口探测重新去找真身
+                        if str(key) != str(sid) and _hg_group_id(val) != gid:
+                            for _k, _v in list(known.items()):
+                                if str(_v) == str(key):
+                                    known.pop(_k, None)
+                else:
+                    for csid, nm in (val or [])[:4]:
+                        if _hg_season_no(nm) == key and csid not in found and csid not in known.values():
+                            known[key] = csid
+                            pending[ex.submit(_hg_sd, csid)] = (u"detail", csid)
+                            break
+            # 缺失季：1..max+1 里没着落的，补探测（每轮最多 4 个）
+            # 已从搜索里认到季号、详情还在路上的，也算有着落，不再重复探同一季
+            _ver = set(x for x in known.keys() if x)
+            for _k, _d in found.items():
+                if _d and (str(_k) == str(sid) or _hg_group_id(_d) == gid):
+                    _ver.add(_hg_season_no(_d.get(u"series_name") or u""))
+            if (len(probed) < 9 and time.time() < t_end
+                    and (len(_ver) >= 2 or _hg_season_no(_nm0) > 0 or bool(_main_ref))):
+                mx = max(_ver) if _ver else 1
+                for n in [x for x in range(1, mx + 2) if x not in _ver and x not in probed][:4]:
+                    probed.add(n)
+                    for _kw in _hg_probe_kws(base, n, _nm0):
+                        pending[ex.submit(_hg_candidates, _kw, 1,
+                                          time.time() + 3)] = (u"probe", n)
+    # 收尾补漏：诱饵被剔除后总会留下空洞，按缺的季号再定向探一次（最多 2 个）
+    _have = set()
+    for _x, _d in found.items():
+        if _d and (str(_x) == str(sid) or _hg_group_id(_d) == gid):
+            _have.add(_hg_season_no(_d.get(u"series_name") or u""))
+    _mx = max(_have) if _have else 1
+    _need = [x for x in range(1, _mx + 1) if x not in _have][:2]
+    if _need:
+        # 两个缺号并发探，不再一个搜完再搜下一个
+        _cand = {}
+        try:
+            _kwjobs = [(kw, _n) for _n in _need for kw in _hg_probe_kws(base, _n, _nm0)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(_kwjobs))) as _ex:
+                _fs = {_ex.submit(_hg_candidates, kw, 1, time.time() + 3): _n
+                       for kw, _n in _kwjobs}
+                for _f in list(_fs):
+                    try:
+                        _cand[_fs[_f]] = _f.result(timeout=4) or []
+                    except Exception:
+                        _cand[_fs[_f]] = []
+        except Exception:
+            _cand = {}
+        _jobs = []
+        for _n, _cl in _cand.items():
+            for _cid, _nm in (_cl or [])[:3]:
+                if _hg_season_no(_nm) == _n and _cid not in found:
+                    _jobs.append((_n, _cid))
+        if _jobs:
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(_jobs))) as _ex:
+                    _fs2 = {_ex.submit(_hg_sd, _cid): _n for _n, _cid in _jobs}
+                    _got = set()
+                    for _f in list(_fs2):
+                        _n = _fs2[_f]
+                        if _n in _got:
+                            continue
+                        try:
+                            _d = _f.result(timeout=5)
+                        except Exception:
+                            continue
+                        if _d and _hg_group_id(_d) == gid:
+                            found[str(_d.get("series_id") or "")] = _d
+                            _got.add(_n)
+            except Exception:
+                pass
+    seasons = []
+    for x, d in found.items():
+        if not d:
+            continue
+        if x != str(sid) and _hg_group_id(d) != gid:
+            continue
+        seasons.append((_hg_season_no(d.get(u"series_name") or u""), d))
+    # 防误判：分集内容与当前剧或已收季高度重叠的（同一部的重复条目）一律剔除
+    def _vset(d):
+        return set(str(v) for v in (d.get("vid_list") or []))
+    _self_v = _vset(sd)
+    _uniq = []
+    for no, d in seasons:
+        v = _vset(d)
+        if not v:
+            continue
+        _is_self = (d is sd) or (str(d.get("series_id") or u"") == str(sid))
+        dup = False
+        if not _is_self and _self_v:
+            small = min(len(v), len(_self_v))
+            if small and len(v & _self_v) >= max(1, int(small * 0.5)):
+                dup = True
+        if not dup:
+            for _n2, _d2 in _uniq:
+                v2 = _vset(_d2)
+                small = min(len(v), len(v2)) if v2 else 0
+                if small and len(v & v2) >= max(1, int(small * 0.5)):
+                    dup = True
+                    break
+        if not dup:
+            _uniq.append((no, d))
+    seasons = _uniq
+    if len(seasons) < 2:
+        # 凑不出第二部同组剧就保持单线路原样，绝不凭空造季
+        _HG_SEASON_CACHE[ck] = (time.time(), [(0, sd)])
+        _trim_store(_HG_SEASON_CACHE, cap=256)
+        return [(0, sd)]
+    seasons.sort(key=lambda t: (t[0] if t[0] else 1))
+    if not any((d is sd) or (str(d.get("series_id") or "") == str(sid)) for _n, d in seasons):
+        seasons.insert(0, (0, sd))
+    _HG_SEASON_CACHE[ck] = (time.time(), seasons)
+    _trim_store(_HG_SEASON_CACHE, cap=256)
+    return seasons
 
 
 class Spider(_BaseSpider):
@@ -8903,12 +6128,6 @@ class Spider(_BaseSpider):
 
     def _adopt_working_pair(self):
         pair = _working_device_pair()
-        if pair is None:
-            # 冷启动（本机无持久化设备）：先注册一对再播，随机号取流必回空体。
-            try:
-                pair = _rotate_stream_device()
-            except Exception:
-                pair = None
         if pair is not None:
             self.device_id = pair["device_id"]
             self.install_id = pair["install_id"]
@@ -8936,31 +6155,16 @@ class Spider(_BaseSpider):
         return False
 
     def action(self, action):
-        """壳的扩展动作入口：action("diag"/"selfcheck"/"log") 返回最近一次失败摘要。"""
-        name = str(action or "").strip().lower()
-        if name in ("diag", "selfcheck", "log", "hg_diag", "hg_selfcheck"):
-            try:
-                return _hg_last_error_text()
-            except Exception:
-                return ""
         return ""
 
     def init(self, extend=""):
         # 每次源实例使用随机合法设备标识；不依赖用户私有配置。
-        try:
-            _hg_banner()
-        except Exception:
-            pass
         try:
             _hg_cache_cleanup(False)
         except Exception:
             pass
         try:
             _dm_series_load()
-        except Exception:
-            pass
-        try:
-            _hg_poll_start()
         except Exception:
             pass
         return None
@@ -8987,9 +6191,11 @@ class Spider(_BaseSpider):
             "iid": self.install_id or "",
         })
         url = "http://127.0.0.1:%d/hg_dm?%s" % (port, query)
-        # 不在这里预取弹幕：短剧预载会提前替下一集调 playerContent，
-        # 于是两集弹幕请求在几百毫秒内挤在一起，最容易撞上接口限流（code=103001），
-        # 一旦那次失败被当成结论，切过去就再没有弹幕了。改由播放器真来取 /hg_dm 时再拉。
+        # 播放器起播后才会来取弹幕，这里先把取数线程跑起来（不阻塞出流）
+        try:
+            _dm_get(vid, sid, self.device_id or "", self.install_id or "", wait=0)
+        except Exception:
+            pass
         _dm_push_local(url, vid)
         label = "红果弹幕"
         if _DM_IN_PLAYER == "url":
@@ -9005,14 +6211,25 @@ class Spider(_BaseSpider):
             pass
 
     def homeContent(self, filter):
-        """分类=官方内容类型（真人剧/漫剧/漫画），二级分类取官方分类路由。"""
-        # 官方 App 顶部两个入口就是「排行榜 / 新剧」（官网 /rank/<key>），
-        # 所以放在分类最前面，打开首页第一屏就能点到。
+        """分类：推荐 + 真人剧/漫剧/AI剧 + 排行榜 + 新剧（漫画已去掉，播不了）。"""
         class_list = [
-            {"type_id": "rank", "type_name": u"排行榜"},
-            {"type_id": "new", "type_name": u"新剧"},
-        ] + [{"type_id": k, "type_name": n} for k, n, _ in _HG_CONTENT_TYPES]
-        filters = {}
+            {"type_id": "recommend", "type_name": "推荐"},
+            {"type_id": "new-drama", "type_name": "新剧"},
+            {"type_id": "rank", "type_name": "排行榜"},
+        ]
+        class_list += [{"type_id": k, "type_name": n} for k, n, _ in _HG_CONTENT_TYPES]
+        filters = {
+            "recommend": [{
+                "key": "tab",
+                "name": "推荐",
+                "value": [{"n": nm, "v": v} for v, nm in _HG_RECOMMEND_TABS],
+            }],
+            "rank": [{
+                "key": "rank",
+                "name": "榜单",
+                "value": [{"n": nm, "v": v} for v, nm in _HG_RANK_ROUTES],
+            }],
+        }
         for k, _n, cats in _HG_CONTENT_TYPES:
             if len(cats) > 1:
                 filters[k] = [{
@@ -9020,34 +6237,7 @@ class Spider(_BaseSpider):
                     "name": "分类",
                     "value": [{"n": nm, "v": v} for v, nm in cats],
                 }]
-        filters["rank"] = [{
-            "key": "cat",
-            "name": u"榜单",
-            "value": [{"n": nm, "v": k} for k, nm in _HG_RANK_TABS if not k.startswith("new-")],
-        }]
-        filters["new"] = [{
-            "key": "cat",
-            "name": u"榜单",
-            "value": [{"n": nm, "v": k} for k, nm in _HG_RANK_TABS if k.startswith("new-")],
-        }]
-        # 首页那块「热门推荐」是壳拿 homeContent.list 自己起的名渲染的。
-        # 按你的要求默认不返回，首页只剩分类入口；想恢复设 HG_HOME_REC=1。
-        vlist = []
-        _rec_on = str(os.environ.get("HG_HOME_REC", "") or "").strip().lower() in (
-            "1", "true", "yes", "on")
-        if _rec_on:
-            try:
-                vlist = _hg_home_sections()
-            except Exception:
-                vlist = []
-            try:
-                _hg_prefetch([x.get("vod_id") for x in vlist], 6)
-            except Exception:
-                pass
-            _hg_diag("home", "rec", n=len(vlist))
-        else:
-            _hg_diag("home", "rec", n=0, why="已关闭首页推荐（HG_HOME_REC=1 可恢复）")
-        return {"class": class_list, "filters": filters, "list": vlist}
+        return {"class": class_list, "filters": filters}
 
     def categoryContent(self, tid, pg, filter, extend):
         """走官方分类页 /category/{route}/{item}?page=N，标题取官方 series_name。"""
@@ -9069,10 +6259,64 @@ class Spider(_BaseSpider):
             f2 = str(filter.get("cat") or filter.get("分类") or "").strip()
             if f2 and not cat:
                 cat = f2
-        if cat in ("all", u"全部", "0", "all_cat"):
+        if cat in ("all", "全部", "0", "all_cat"):
             cat = ""
-        if str(tid) in ("rank", "new"):
-            return _hg_rank_content(tid, page, cat)
+        _tid = str(tid or "").strip()
+        if _tid in ("rank", "new-drama"):
+            if _tid == "new-drama":
+                route = "new-drama"
+            else:
+                route = str(ext.get("rank") or ext.get("榜单") or "").strip()
+                if isinstance(filter, dict):
+                    f2 = str(filter.get("rank") or filter.get("榜单") or "").strip()
+                    if f2 and not route:
+                        route = f2
+                if route not in _HG_RANK_ROUTE_SET:
+                    route = "hot-drama"
+            try:
+                rows = _hg_rank_page(route, page)
+            except Exception:
+                rows = _hg_rank_page("new-drama" if _tid == "new-drama" else "hot-drama", page)
+            # rankList 每页 20 条，未给总页数：满 20 条就允许再翻一页，不满即最后一页
+            pagecount = page + 1 if len(rows) >= 20 else page
+            return {
+                "page": page,
+                "pagecount": max(1, pagecount),
+                "limit": len(rows),
+                "total": len(rows),
+                "list": [_rank_item(x) for x in rows],
+            }
+        if str(tid or "").strip() == "recommend":
+            tab = str(ext.get("tab") or ext.get("推荐") or "").strip()
+            if isinstance(filter, dict):
+                tab2 = str(filter.get("tab") or filter.get("推荐") or "").strip()
+                if tab2 and not tab:
+                    tab = tab2
+            try:
+                rec_rows = _hg_recommend_rows(tab)
+            except Exception:
+                # 首页取不到推荐时回落到真人剧全部，避免推荐页空白
+                p = _hg_category_page("real-drama", cat, page)
+                rec_rows = p.get("recommendList") or []
+                page_data = p.get("pagination") or {}
+                return {
+                    "page": page,
+                    "pagecount": int(page_data.get("totalPages") or 1),
+                    "limit": len(rec_rows),
+                    "total": int(page_data.get("total") or len(rec_rows)),
+                    "list": [_cat_item(x) for x in rec_rows],
+                }
+            page_size = 18
+            total = len(rec_rows)
+            pagecount = max(1, (total + page_size - 1) // page_size)
+            part = rec_rows[(page - 1) * page_size:page * page_size]
+            return {
+                "page": page,
+                "pagecount": pagecount,
+                "limit": len(part),
+                "total": total,
+                "list": [_cat_item(x) for x in part],
+            }
         try:
             p = _hg_category_page(route, cat, page)
         except Exception:
@@ -9084,7 +6328,7 @@ class Spider(_BaseSpider):
             "pagecount": int(page_data.get("totalPages") or 1),
             "limit": len(rows),
             "total": int(page_data.get("total") or len(rows)),
-            "list": _hg_cat_list(rows),
+            "list": [_cat_item(x) for x in rows],
         }
 
     def searchContent(self, key, quick=False, pg="1"):
@@ -9093,7 +6337,10 @@ class Spider(_BaseSpider):
         except (TypeError, ValueError):
             page = 1
         key = str(key or "").strip() or "短剧"
-        # 漫剧相关搜索走关键词轮换，提升翻页体验
+        # AI/漫剧相关搜索也走关键词轮换，提升翻页体验
+        low = key.lower()
+        if key in ("AI漫剧", "ai漫剧") or "ai漫" in low:
+            return _search_by_keywords(_AI_MANJU_KEYWORDS, page)
         if key in ("漫剧", "动漫短剧"):
             return _search_by_keywords(_MANJU_KEYWORDS, page)
 
@@ -9123,10 +6370,6 @@ class Spider(_BaseSpider):
             out.append(it)
         if not total:
             total = len(out)
-        try:
-            _hg_prefetch([x.get("vod_id") for x in out], 2)
-        except Exception:
-            pass
         return {
             "page": page,
             "pagecount": max(1, min(50, total_pages if total_pages else 1)),
@@ -9137,19 +6380,6 @@ class Spider(_BaseSpider):
 
 
     def detailContent(self, ids):
-        """壳可能一次要好几个（批量解析）：逐部出卡；只传一个时行为完全不变。"""
-        id_list = list(ids) if isinstance(ids, (list, tuple)) else [ids]
-        out = []
-        for _one in id_list[:10]:
-            try:
-                out.extend(self._detail_one(_one).get("list") or [])
-            except Exception as exc:
-                _hg_diag("detail", "skip", id=_hg_clean(_one, 30), err=type(exc).__name__)
-        if len(id_list) > 1:
-            _hg_diag("detail", "batch", asked=len(id_list), got=len(out))
-        return {"list": out}
-
-    def _detail_one(self, ids):
         sid = str(ids[0] if isinstance(ids, (list, tuple)) else ids)
         sid = sid.replace("hg-series-v1:", "")
         s = {}
@@ -9157,31 +6387,8 @@ class Spider(_BaseSpider):
         # 磁盘缓存（6 小时）：同一部剧二次进入零请求
         try:
             _c = _hg_disk_load().get(sid)
-            # 单季结果只锁 2 小时：一次搜索抖动就当成「这部剧只有一季」并锁 24 小时，
-            # 是「第二季没合并」最隐蔽的一种。v4 顺带作废旧版缓存。
-            # 先判类型再取字段：缓存值万一不是 dict，原来会在这一行抛异常被外层吞掉，
-            # 结果是把好缓存整条清空重来。
-            _ttl = 600
-            if isinstance(_c, dict):
-                _ttl = 12 * 3600 if len(_c.get("seasons") or []) > 1 else 2 * 3600
-                if _c.get("trim"):
-                    _ttl = 600
-            if isinstance(_c, dict):
-                # 列表页看到过这部剧的当前集数，和缓存里记的不一样 → 官方加集了，直接重拉
-                _now = _HG_STAMP.get(sid)
-                _old = _c.get("cnt")
-                if _now and _old and int(_now) != int(_old):
-                    _hg_diag("detail", "stale-cnt", sid=sid, cached=_old, now=_now,
-                             why="官方集数变了，缓存作废")
-                    _c = None
-                    # 连 5 分钟的详情缓存和 15 分钟的分季结论一起作废，
-                    # 否则「重拉」还是从这两个内存缓存里拿旧数据，等于白作废
-                    try:
-                        _HG_SEASON_CACHE.pop("sd:" + str(sid), None)
-                        _HG_SEASON_CACHE.pop("season:" + str(sid), None)
-                    except Exception:
-                        pass
-            if isinstance(_c, dict) and _c.get("v") == 4 and time.time() - float(_c.get("ts") or 0) < _ttl:
+            if isinstance(_c, dict) and _c.get("v") == 3 and time.time() - float(_c.get("ts") or 0) < (
+                    12 * 3600 if len(_c.get("seasons") or []) > 1 else 24 * 3600):
                 seasons = [(int(x.get("no") or 0), x.get("sd") or {})
                            for x in (_c.get("seasons") or []) if isinstance(x, dict)]
                 for _no, _d in seasons:
@@ -9190,12 +6397,6 @@ class Spider(_BaseSpider):
                         break
                 if not s:
                     s = _c.get("self") or {}
-                # 打开即刷新：缓存超过 HG_SWR_MIN（默认 30 分钟）就先返回旧的，
-                # 同时后台重拉一次，下次进来就是最新的。不阻塞这次打开。
-                if time.time() - float(_c.get("ts") or 0) > _HG_SWR_AFTER:
-                    _hg_diag("detail", "swr", sid=sid,
-                             age_min=int((time.time() - float(_c.get("ts") or 0)) / 60))
-                    _hg_refresh_async(sid)
         except Exception:
             s = {}
             seasons = []
@@ -9207,9 +6408,7 @@ class Spider(_BaseSpider):
                 seasons = [(0, s)]
             try:
                 _all = _hg_disk_load()
-                _payload = {"v": 4, "ts": time.time(), "trim": 1 if str(sid) in _HG_TRIM_SIDS else 0,
-                            "cnt": int(s.get("episode_cnt") or len(_hg_slim(s).get("vid_list") or []) or 0),
-                            "self": _hg_slim(s),
+                _payload = {"v": 3, "ts": time.time(), "self": _hg_slim(s),
                             "seasons": [{"no": no, "sd": _hg_slim(d)} for no, d in seasons]}
                 _all[sid] = _payload
                 # 同组的其它季也各存一份，从搜索直接点别的季也能零请求命中
@@ -9221,10 +6420,6 @@ class Spider(_BaseSpider):
             except Exception:
                 pass
         vids = s.get("vid_list") or []
-        if not vids:
-            _hg_fail("detail/no-vids", HongguoPluginError(
-                "详情里没有 vid_list", code="HG_E_MODEL_EMPTY"),
-                sid=sid, keys=len(s.keys()) if isinstance(s, Mapping) else 0)
         actors = [str(x.get("nickname")) for x in (s.get("celebrities") or []) if isinstance(x, dict) and x.get("nickname")]
         # 弹幕映射：把每一季的每一集都登记到本剧
         try:
@@ -9253,6 +6448,17 @@ class Spider(_BaseSpider):
                     return True
                 return str(d.get("series_id") or u"") == str(sid)
             ordered = [x for x in seq if _is_self(x[1])] + [x for x in seq if not _is_self(x[1])]
+            # 全季连播：各季按季号顺序拼成一条线，集号连续 1..N，画质固定超清（1080），排第一默认选中
+            _all_eps = []
+            for _no, _d in seq:
+                _all_eps.extend([str(v) for v in (_d.get("vid_list") or []) if str(v).isdigit()])
+            if _all_eps:
+                _eps_all = "#".join(
+                    "%d%s%s%s:%s" % (i + 1, "$", EPISODE_PREFIX, "1080", v)
+                    for i, v in enumerate(_all_eps)
+                )
+                play_from.append(u"全季连播 %d集" % len(_all_eps))
+                play_url.append(_eps_all)
             for no, d in ordered:
                 evids = [str(v) for v in (d.get("vid_list") or []) if str(v).isdigit()]
                 if not evids or tuple(evids) in used:
@@ -9267,25 +6473,6 @@ class Spider(_BaseSpider):
                 )
                 play_from.append(label)
                 play_url.append(eps)
-            # 全季连播：按季号把所有季的集数顺次拼成一条线路，放在最前面（壳默认选它）。
-            # 这样第一季最后一集播完，壳的「自动下一集」会直接接第二季第一集，
-            # 不用退回列表手动换线路。各季各自的线路照旧保留。
-            if len(play_from) >= 2:
-                _seen_all = set()
-                _eps_all = []
-                for _no, _d in seq:
-                    for _v in (_d.get("vid_list") or []):
-                        _v = str(_v)
-                        if not _v.isdigit() or _v in _seen_all:
-                            continue
-                        _seen_all.add(_v)
-                        _eps_all.append("%d%s%s%s:%s" % (
-                            len(_eps_all) + 1, "$", EPISODE_PREFIX, "1080", _v))
-                if len(_eps_all) > len(play_url[0].split("#")):
-                    play_from.insert(0, u"全季连播 %d集" % len(_eps_all))
-                    play_url.insert(0, "#".join(_eps_all))
-                    _hg_diag("detail", "chain", sid=sid, seasons=len(play_url) - 1,
-                             eps=len(_eps_all))
         if not play_from:
             # 单季：沿用模板五档画质线路，原样不动
             for q, line_name in _HG_QUALITY_LINES:
@@ -9310,10 +6497,7 @@ class Spider(_BaseSpider):
                 _dm_series_save()
         except Exception:
             pass
-        _hg_diag("detail", "ok", sid=sid, vids=len(vids), seasons=len(seasons),
-                 lines=len(play_from))
         return {"list": [{"vod_id": sid, "vod_name": str(s.get("series_name") or ""), "vod_pic": str(s.get("series_cover") or ""), "vod_year": "", "vod_area": "", "vod_director": "", "vod_actor": ",".join(actors), "vod_content": str(s.get("series_intro") or ""), "vod_remarks": str(s.get("episode_right_text") or ""), "vod_play_from": "$$$".join(play_from), "vod_play_url": "$$$".join(play_url)}]}
-
     def playerContent(self, flag, id, vipFlags=None):
         self._adopt_working_pair()
         # 从线路名（flag，如“红果超清/红果高清”）与集 token 双路解析清晰度。
@@ -9327,18 +6511,14 @@ class Spider(_BaseSpider):
         q = line_q if token_q == "1080" and str(flag) else token_q
         q = q if q in _QUALITY_LINE_NAME_TO_Q else "1080"
         if not str(vid).isdigit():
-            _hg_fail("playerContent/token", HongguoPluginError(
-                "集 token 里没有有效 vid", code="HG_E_TOKEN"),
-                token=_hg_clean(id, 60), flag=_hg_clean(flag, 40))
             return {
                 "parse": 1,
                 "jx": 0,
                 "playUrl": "",
                 "url": SITE + "/",
-                "msg": "红果取流失败：集 token 里没有有效 vid",
                 "header": {"User-Agent": UA},
             }
-        # 取流优先级：本机 Range 流服务 > 上游直通直链 > 壳代理。
+        # 取流优先级：本机 Range 流服务 > 壳代理。
         # 壳代理（fongmi / OK影视 的 /proxy?do=py）实测会忽略 Range：对 bytes=0-1023
         # 也回 200 + 整片 + chunked，既无 Content-Range 也无 Accept-Ranges，且必须
         # 等整片下载 + CENC 解密完成后才吐首字节（单集 12~17MB，实测 8.7s / 16.3s，
@@ -9346,52 +6526,21 @@ class Spider(_BaseSpider):
         # 按新 URL 重新请求即超时失败，表现为“第 1 集能放、第 2 集不能放”。
         # 本机流服务支持 206 / Content-Range / Accept-Ranges，首字节约 1s，切集稳定。
         # 会话构建（取 video_model + 拉 moov）在冷启动时约 3~18s，若等到播放器连上来
-        # 才建会话，响应头会被拖延到读超时。这里先建好会话再交 URL。
-        cfg = {"device_id": self.device_id or "", "install_id": self.install_id or ""}
-        session = None
-        build_err = None
-        build_started = time.time()
-        _hg_diag("play", "start", vid=vid, q=q, line=_hg_clean(flag, 40),
-                 did=_hg_tail(self.device_id), iid=_hg_tail(self.install_id))
+        # 才建会话，响应头会被拖延到读超时。这里先建好会话再交 URL（参考红果短剧版
+        # 的同步做法）：播放器连上来时直接命中已建好的会话，首字节约 1s，不再赌
+        # 异步预热线程能不能在播放器 8s 读超时前跑完。建会话失败也不阻塞，
+        # 仍交本地 URL 让服务端按需再建，起不来再回退壳代理。
         try:
-            session = _stream_session(vid, cfg, q)
-        except Exception as exc:
-            build_err = exc
-            code = _hg_fail("playerContent/session", exc, vid=vid, q=q,
-                            ms=_hg_ms(build_started))
-            # 空体/超时是成波来的：同一秒重试没用，挂后台继续试，
-            # 用户过一会儿再点一次通常直接命中缓存。
-            if _hg_retryable(exc):
-                try:
-                    _warm_burst(vid, dict(cfg), q)
-                    _hg_diag("warm", "已挂后台重试", vid=vid, q=q, code=code)
-                except Exception:
-                    pass
-
-        def _try_start_server(wait):
-            # 启本机服务对弹幕(直通路)/中转(CENC路)是加分项而非前提；宿主环境禁止
-            # bind 127.0.0.1 时 _start_stream_server 可能挂起，放线程里限时等，
-            # 拿不到端口就放弃，绝不让播放器干等。
-            box = {}
-            def _run():
-                try:
-                    box["port"] = _start_stream_server()
-                except Exception:
-                    pass
-            t = threading.Thread(target=_run, daemon=True)
-            t.start()
-            t.join(wait)
-            return box.get("port", 0)
-
-        # 直通流（上游本来就是标准 hvc1/avc1 未加密）：本机服务起不来时可以直接把
-        # 上游 https 直链交给播放器，播放器自己发 Range，不会卡在“正在获取播放信息”。
-        plain_url = ""
-        if isinstance(session, _PlainSession):
-            plain_url = session.url or ""
-
-        port = _try_start_server(1.5 if plain_url else 3.0)
-        if not port:
-            _hg_diag("route", "本机流服务不可用", plain=int(bool(plain_url)))
+            _stream_session(vid, {
+                "device_id": self.device_id or "",
+                "install_id": self.install_id or "",
+            }, q)
+        except Exception:
+            pass
+        try:
+            port = _start_stream_server()
+        except Exception:
+            port = 0
         if port:
             query = urlencode(
                 {
@@ -9412,19 +6561,7 @@ class Spider(_BaseSpider):
                 result.update(self._danmaku_payload(port, vid))
             except Exception:
                 pass
-            _hg_diag("route", "本机流服务", port=port, q=q,
-                     session=("plain" if plain_url else "cenc"))
             return result
-        # 本机服务不可用（宿主禁 bind 127.0.0.1）：直通流直接交上游直链。
-        if plain_url:
-            _hg_diag("route", "上游直链", host=urlparse(plain_url).netloc, q=q)
-            return {
-                "parse": 0,
-                "jx": 0,
-                "playUrl": "",
-                "url": plain_url,
-                "header": {"User-Agent": MEDIA_UA},
-            }
         # 回退：壳代理（保留壳自带的 do=py，不要覆盖 do）
         proxy = ""
         try:
@@ -9443,7 +6580,6 @@ class Spider(_BaseSpider):
                     "iid": self.install_id or "",
                 }
             )
-            _hg_diag("route", "壳代理", proxy=_hg_clean(proxy, 60))
             return {
                 "parse": 0,
                 "jx": 0,
@@ -9454,34 +6590,14 @@ class Spider(_BaseSpider):
                     "Referer": "https://novel.snssdk.com/",
                 },
             }
-        # 一条路都不通：错误码写进日志和「最近失败」摘要，再回退到官网首页。
-        reason = ""
-        if build_err is not None:
-            reason = _hg_clean(build_err, 160)
-            code_text = _hg_err_code(build_err)
-            if code_text and not reason.startswith(code_text):
-                reason = "%s %s" % (code_text, reason)
-        _hg_fail(
-            "playerContent/route",
-            build_err if build_err is not None else HongguoPluginError(
-                "无可用播放路由", code="HG_E_NO_ROUTE"
-            ),
-            vid=vid, q=q, port=port, plain=int(bool(plain_url)), proxy=int(bool(proxy)),
-            ms=_hg_ms(build_started),
-        )
-        try:
-            print("[红果] 取流失败 vid=%s q=%s：%s（原因见 hg_last_error.txt / hg_diag.log）"
-                  % (vid, q, reason or "无可用播放路由"))
-        except Exception:
-            pass
         return {
             "parse": 1,
             "jx": 0,
             "playUrl": "",
             "url": SITE + "/",
-            "msg": "红果取流失败：" + (reason or "无可用播放路由"),
             "header": {"User-Agent": UA},
         }
+
 
     def proxy(self, param):
         """部分壳调用 proxy 而不是 localProxy。"""
@@ -9536,14 +6652,14 @@ class Spider(_BaseSpider):
                 primary = quals
             for q in primary:
                 cached = _hg_cache_get(vid, q)
-                if cached and _hg_cached_ok(cached):
+                if cached:
                     return [200, "video/mp4", cached]
 
             model = None
             rows = None
             for _round in range(4):
                 try:
-                    model = _video_model(vid, cfg)
+                    model = _video_model_rotating(vid, cfg)
                 except Exception as err:
                     if not _is_empty_model_error(err) or _round >= 3:
                         raise
@@ -9569,34 +6685,8 @@ class Spider(_BaseSpider):
                 try:
                     # 再查一次该清晰度缓存（model 解析后）
                     cached = _hg_cache_get(vid, wanted)
-                    if cached and _hg_cached_ok(cached):
+                    if cached:
                         return [200, "video/mp4", cached]
-
-                    if _hg_is_bytevc2(rows):
-                        # 只认这一档自己验过的标准 hvc1 直通流；encv 是加密壳，不能直接回吐
-                        try:
-                            plain_sess = _hg_plain_session(model, wanted, True)
-                        except Exception:
-                            plain_sess = None
-                        if plain_sess is not None:
-                            body = b""
-                            try:
-                                body = _multi_download(
-                                    plain_sess.url,
-                                    headers={"User-Agent": MEDIA_UA, "Referer": "https://novel.snssdk.com/"},
-                                    timeout=150 if _aes_is_fast() else 120,
-                                    workers=4,
-                                )
-                            except Exception as dl_err:
-                                last_err = "plain download failed q=%s err=%s" % (wanted, dl_err)
-                                body = b""
-                            _i = body.find(b"stsd") if body else -1
-                            if body and (_i < 0 or body[_i + 16 : _i + 20] in _DECODABLE_ENTRIES):
-                                try:
-                                    _hg_cache_put(vid, wanted, body)
-                                except Exception:
-                                    pass
-                                return [200, "video/mp4", body]
 
                     _, item = _select_quality(rows, wanted)
                     url = _media_url(item)
